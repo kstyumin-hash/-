@@ -5,7 +5,8 @@
 
 import asyncio
 import logging
-import sqlite3
+import psycopg2
+import psycopg2.errorcodes
 import json
 import uuid
 import os
@@ -52,8 +53,12 @@ DONATION_ACCESS_TOKEN = os.environ.get("DONATION_ACCESS_TOKEN", "")
 DONATION_SECRET_KEY = os.environ.get("DONATION_SECRET_KEY", "")
 DONATION_API_URL = "https://www.donationalerts.com/api/v1"
 
-DATABASE = "stopka_vpn.db"
-JSON_FILE = "Vpn_data.json"
+# На Free-плане Render файловая система не сохраняется между деплоями,
+# поэтому данные хранятся во внешней PostgreSQL (тоже есть бесплатный тариф).
+# Строку подключения нужно задать в переменных окружения Render как DATABASE_URL
+# (Render сам выдаёт её при создании PostgreSQL-инстанса).
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+JSON_FILE = os.path.join(os.environ.get("DATA_DIR", "."), "Vpn_data.json")
 PORT = int(os.getenv("PORT", 8080))
 
 # VPN настройки
@@ -115,24 +120,57 @@ rate_limiter = RateLimiter()
 # DATABASE
 ############################################################
 
+# Единая ошибка нарушения уникальности/ограничений - раньше код ловил
+# sqlite3.IntegrityError, здесь используем это же имя для минимальных правок.
+IntegrityError = psycopg2.errors.lookup(psycopg2.errorcodes.UNIQUE_VIOLATION)
+
+class PGConnection:
+    """
+    Тонкая обёртка над psycopg2, повторяющая интерфейс sqlite3.Connection,
+    который используется по всему файлу: conn.execute(sql, params) с
+    плейсхолдерами '?' и conn.commit(). Это позволяет не переписывать
+    сотню мест использования db.conn.execute(...) по всему коду.
+    """
+    def __init__(self, dsn):
+        self._conn = psycopg2.connect(dsn)
+        self._conn.autocommit = False
+
+    def execute(self, query, params=()):
+        pg_query = query.replace("?", "%s")
+        cur = self._conn.cursor()
+        try:
+            cur.execute(pg_query, params)
+        except Exception:
+            # После ошибки Postgres блокирует транзакцию до rollback -
+            # делаем это автоматически, как сделал бы sqlite3.
+            self._conn.rollback()
+            raise
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect(DATABASE, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "Не задана переменная окружения DATABASE_URL "
+                "(строка подключения к PostgreSQL)."
+            )
+        self.conn = PGConnection(DATABASE_URL)
         self.create_tables()
 
     def create_tables(self):
         # Пользователи
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY,
+            id BIGINT PRIMARY KEY,
             username TEXT,
             name TEXT,
             expire_date TEXT,
             status TEXT,
             is_admin INTEGER DEFAULT 0,
-            invited_by INTEGER DEFAULT 0,
+            invited_by BIGINT DEFAULT 0,
             first_payment INTEGER DEFAULT 0,
             last_tariff TEXT,
             username_history TEXT DEFAULT '[]'
@@ -142,8 +180,8 @@ class Database:
         # Тикеты
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS tickets(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             message TEXT,
             answer TEXT,
             status TEXT
@@ -153,8 +191,8 @@ class Database:
         # Платежи
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS payments(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             payment_code TEXT UNIQUE,
             amount INTEGER,
             days INTEGER,
@@ -166,8 +204,8 @@ class Database:
         # История платежей
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS payment_history(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             amount INTEGER,
             days INTEGER,
             date TEXT
@@ -187,8 +225,8 @@ class Database:
         # Рефералы
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS referrals(
-            user_id INTEGER PRIMARY KEY,
-            invited_by INTEGER,
+            user_id BIGINT PRIMARY KEY,
+            invited_by BIGINT,
             bonus_given INTEGER DEFAULT 0
         )
         """)
@@ -196,10 +234,10 @@ class Database:
         # Логи админов
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS admin_logs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            admin_id BIGINT,
             action TEXT,
-            target_id INTEGER,
+            target_id BIGINT,
             created_at TEXT
         )
         """)
@@ -207,8 +245,8 @@ class Database:
         # Устройства (VPN)
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS devices(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             device_name TEXT,
             private_key TEXT,
             public_key TEXT,
@@ -231,7 +269,7 @@ class Database:
         # Уведомления
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS notifications(
-            user_id INTEGER,
+            user_id BIGINT,
             type TEXT,
             date TEXT,
             PRIMARY KEY (user_id, type)
@@ -381,7 +419,10 @@ class Database:
 
     def save_notification(self, user_id, ntype):
         self.conn.execute(
-            "INSERT OR REPLACE INTO notifications (user_id, type, date) VALUES(?,?,?)",
+            """
+            INSERT INTO notifications (user_id, type, date) VALUES(?,?,?)
+            ON CONFLICT (user_id, type) DO UPDATE SET date = EXCLUDED.date
+            """,
             (user_id, ntype, datetime.now().strftime("%Y-%m-%d"))
         )
         self.conn.commit()
@@ -725,12 +766,12 @@ def promo_admin_keyboard():
 # MIDDLEWARES
 ############################################################
 
-@dp.message()
-async def rate_limit_middleware(message: Message):
+@dp.message.middleware()
+async def rate_limit_middleware(handler, message: Message, data: dict):
     if not rate_limiter.is_allowed(message.from_user.id):
         await message.answer("⏳ Слишком много запросов. Подождите немного.")
-        return False
-    return True
+        return
+    return await handler(message, data)
 
 ############################################################
 # START & HELP
@@ -1245,7 +1286,7 @@ async def create_payment(callback: CallbackQuery):
             VALUES(?,?,?,?,?,?)
         """, (callback.from_user.id, code, tariff["price"], tariff["days"], "waiting", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         db.conn.commit()
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         code = create_payment_code()
         db.conn.execute("""
             INSERT INTO payments (user_id, payment_code, amount, days, status, date) 
