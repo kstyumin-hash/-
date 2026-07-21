@@ -1,6 +1,6 @@
 # ==========================================================
 # Stopka VPN - Полноценный VPN сервис
-# Telegram Bot + Web Server (для Render)
+# Telegram Bot + Web Server (для Render) + DonationAlerts API
 # ==========================================================
 
 import asyncio
@@ -12,6 +12,7 @@ import os
 import html
 import io
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -43,6 +44,7 @@ OWNER_ID = int(os.environ.get("OWNER_ID", 5604869107))
 # DonationAlerts
 DONATION_ACCESS_TOKEN = os.environ.get("DONATION_ACCESS_TOKEN", "")
 DONATION_SECRET_KEY = os.environ.get("DONATION_SECRET_KEY", "")
+DONATION_USERNAME = os.environ.get("DONATION_USERNAME", "your_da_username")
 DONATION_API_URL = "https://www.donationalerts.com/api/v1"
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -330,13 +332,13 @@ class Database:
         self.conn.commit()
 
     def is_donation_processed(self, donation_id):
-        cursor = self.conn.execute("SELECT 1 FROM processed_donations WHERE donation_id=?", (donation_id,))
+        cursor = self.conn.execute("SELECT 1 FROM processed_donations WHERE donation_id=?", (str(donation_id),))
         return cursor.fetchone() is not None
 
     def mark_donation_processed(self, donation_id):
         self.conn.execute(
             "INSERT INTO processed_donations (donation_id, processed_at) VALUES(?,?)",
-            (donation_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            (str(donation_id), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         )
         self.conn.commit()
 
@@ -423,8 +425,9 @@ def admin_back_keyboard():
     ])
 
 def donation_keyboard(code):
+    pay_url = f"https://www.donationalerts.com/r/{DONATION_USERNAME}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Оплатить DonationAlerts", url="https://www.donationalerts.com/")],
+        [InlineKeyboardButton(text="💸 Перейти к оплате", url=pay_url)],
         [InlineKeyboardButton(text="🔎 Проверить оплату", callback_data=f"check_payment:{code}")],
         [InlineKeyboardButton(text="⬅ Назад", callback_data="payment")]
     ])
@@ -513,6 +516,51 @@ async def render_profile(user_id, target_message=None, callback=None):
         await callback.answer()
     elif target_message:
         await target_message.answer(text, reply_markup=kb)
+
+async def process_successful_payment(user_id, payment_code, amount, days):
+    user = db.get_user(user_id)
+    if not user:
+        return False
+
+    try:
+        expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+    except:
+        expire = datetime.now()
+
+    now = datetime.now()
+    if expire < now:
+        expire = now
+
+    new_expire = expire + timedelta(days=days)
+    new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
+
+    # Обновление подписки
+    db.conn.execute("UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (new_expire_str, user_id))
+    db.conn.execute("UPDATE payments SET status='paid' WHERE payment_code=?", (payment_code,))
+    
+    # Проверка первого платежа и выдача бонуса пригласившему
+    if user[7] == 0:
+        db.mark_first_payment(user_id)
+        invited_by = user[6]
+        if invited_by and invited_by != 0:
+            inviter = db.get_user(invited_by)
+            if inviter:
+                try:
+                    inv_expire = datetime.strptime(inviter[3], "%Y-%m-%d %H:%M:%S")
+                except:
+                    inv_expire = datetime.now()
+                if inv_expire < now:
+                    inv_expire = now
+                inv_new_expire = inv_expire + timedelta(days=REFERRAL_DAYS)
+                db.conn.execute("UPDATE users SET expire_date=? WHERE id=?", (inv_new_expire.strftime("%Y-%m-%d 23:59:59"), invited_by))
+                db.conn.execute("UPDATE referrals SET bonus_given=1 WHERE user_id=?", (user_id,))
+                try:
+                    await bot.send_message(invited_by, f"🎁 Твой реферал оплатил подписку! Тебе начислено +{REFERRAL_DAYS} дней VPN.")
+                except:
+                    pass
+
+    db.conn.commit()
+    return True
 
 ############################################################
 # COMMANDS: START, HELP, ABOUT
@@ -604,7 +652,6 @@ async def process_pay(callback: CallbackQuery):
     db.save_last_tariff(callback.from_user.id, tariff_id)
     
     def create_payment_code():
-        import uuid
         return f"STOPKA-{uuid.uuid4().hex[:8].upper()}"
 
     code = create_payment_code()
@@ -625,12 +672,69 @@ async def process_pay(callback: CallbackQuery):
     await callback.message.edit_text(
         f"💳 <b>Оплата Stopka VPN</b>\n\n"
         f"Тариф: <b>{tariff['name']}</b> (+{tariff['days']} дней)\n"
-        f"Сумма: <b>{tariff['price']}₽</b>\n\n"
-        f"Ваш код оплаты:\n<code>{code}</code>\n\n"
-        f"Укажите этот код в комментарии при переводе.",
+        f"Сумма к оплате: <b>{tariff['price']} ₽</b>\n\n"
+        f"📌 Ваш код оплаты (скопируйте его в комментарий к переводу):\n<code>{code}</code>\n\n"
+        f"<b>Инструкция:</b>\n"
+        f"1. Нажмите «Перейти к оплате» ниже.\n"
+        f"2. Укажите сумму <b>{tariff['price']} ₽</b>.\n"
+        f"3. Обязательно вставьте <code>{code}</code> в поле «Сообщение» (комментарий).\n"
+        f"4. После перевода нажмите «Проверить оплату».",
         reply_markup=donation_keyboard(code)
     )
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("check_payment:"))
+async def check_payment_callback(callback: CallbackQuery):
+    code = callback.data.split(":")[1]
+    payment = db.conn.execute("SELECT * FROM payments WHERE payment_code=?", (code,)).fetchone()
+    
+    if not payment:
+        await callback.answer("❌ Платеж не найден.", show_alert=True)
+        return
+
+    if payment[5] == "paid":
+        await callback.answer("✅ Этот платеж уже успешно обработан!", show_alert=True)
+        await render_profile(callback.from_user.id, callback=callback)
+        return
+
+    if not DONATION_ACCESS_TOKEN:
+        await callback.answer("⚠️ API токен DonationAlerts не настроен администратором.", show_alert=True)
+        return
+
+    # Запрос к DonationAlerts API
+    headers = {"Authorization": f"Bearer {DONATION_ACCESS_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(f"{DONATION_API_URL}/alerts/donations", headers=headers) as resp:
+                if resp.status != 200:
+                    await callback.answer("⚠️ Ошибка подключения к DonationAlerts API", show_alert=True)
+                    return
+                
+                data = await resp.json()
+                donations = data.get("data", [])
+                
+                found = False
+                for don in donations:
+                    don_id = don.get("id")
+                    message_text = don.get("message", "")
+                    amount = float(don.get("amount", 0))
+
+                    if code in message_text and amount >= payment[3]:
+                        if not db.is_donation_processed(don_id):
+                            db.mark_donation_processed(don_id)
+                            await process_successful_payment(payment[1], code, payment[3], payment[4])
+                            found = True
+                            break
+
+                if found:
+                    await callback.answer("🎉 Оплата успешно подтверждена! Подписка продлена.", show_alert=True)
+                    await render_profile(callback.from_user.id, callback=callback)
+                else:
+                    await callback.answer("❌ Платеж с таким кодом не найден. Проверьте комментарий и повторите через минуту.", show_alert=True)
+
+        except Exception as e:
+            logging.error(f"Ошибка проверки оплаты: {e}")
+            await callback.answer("❌ Ошибка при проверке. Попробуйте чуть позже.", show_alert=True)
 
 ############################################################
 # REFERRAL & PROMO
@@ -1010,11 +1114,39 @@ async def broadcast_finish(message: Message, state: FSMContext):
 ############################################################
 
 async def check_payments():
+    """Фоновая автоматическая проверка всех незавершенных платежей"""
     while True:
         try:
-            pass
+            if DONATION_ACCESS_TOKEN:
+                waiting_payments = db.conn.execute("SELECT user_id, payment_code, amount, days FROM payments WHERE status='waiting'").fetchall()
+                if waiting_payments:
+                    headers = {"Authorization": f"Bearer {DONATION_ACCESS_TOKEN}"}
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(f"{DONATION_API_URL}/alerts/donations", headers=headers) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                donations = data.get("data", [])
+                                for don in donations:
+                                    don_id = don.get("id")
+                                    message_text = don.get("message", "")
+                                    amount = float(don.get("amount", 0))
+
+                                    for p in waiting_payments:
+                                        p_user_id, p_code, p_amount, p_days = p
+                                        if p_code in message_text and amount >= p_amount:
+                                            if not db.is_donation_processed(don_id):
+                                                db.mark_donation_processed(don_id)
+                                                success = await process_successful_payment(p_user_id, p_code, p_amount, p_days)
+                                                if success:
+                                                    try:
+                                                        await bot.send_message(
+                                                            p_user_id,
+                                                            f"🎉 <b>Оплата получена!</b>\n\nВам зачислено +{p_days} дней VPN."
+                                                        )
+                                                    except:
+                                                        pass
         except Exception as e:
-            logging.error(f"Ошибка проверки платежей: {e}")
+            logging.error(f"Ошибка фоновой проверки платежей: {e}")
         await asyncio.sleep(30)
 
 async def subscription_notifications():
