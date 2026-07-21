@@ -13,6 +13,7 @@ import html
 import io
 import time
 import uuid
+from urllib.parse import urlencode
 from collections import defaultdict
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -424,8 +425,13 @@ def admin_back_keyboard():
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")]
     ])
 
-def donation_keyboard(code):
-    pay_url = f"https://www.donationalerts.com/r/{DONATION_USERNAME}"
+def donation_keyboard(code, amount):
+    # Автоматическое добавление параметров суммы и комментария к ссылке
+    params = {
+        "amount": amount,
+        "message": code
+    }
+    pay_url = f"https://www.donationalerts.com/r/{DONATION_USERNAME}?{urlencode(params)}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💸 Перейти к оплате", url=pay_url)],
         [InlineKeyboardButton(text="🔎 Проверить оплату", callback_data=f"check_payment:{code}")],
@@ -673,13 +679,12 @@ async def process_pay(callback: CallbackQuery):
         f"💳 <b>Оплата Stopka VPN</b>\n\n"
         f"Тариф: <b>{tariff['name']}</b> (+{tariff['days']} дней)\n"
         f"Сумма к оплате: <b>{tariff['price']} ₽</b>\n\n"
-        f"📌 Ваш код оплаты (скопируйте его в комментарий к переводу):\n<code>{code}</code>\n\n"
+        f"📌 Ваш код оплаты:\n<code>{code}</code>\n\n"
         f"<b>Инструкция:</b>\n"
         f"1. Нажмите «Перейти к оплате» ниже.\n"
-        f"2. Укажите сумму <b>{tariff['price']} ₽</b>.\n"
-        f"3. Обязательно вставьте <code>{code}</code> в поле «Сообщение» (комментарий).\n"
-        f"4. После перевода нажмите «Проверить оплату».",
-        reply_markup=donation_keyboard(code)
+        f"2. Сумма и комментарий заплатятся автоматически.\n"
+        f"3. После перевода нажмите «Проверить оплату».",
+        reply_markup=donation_keyboard(code, tariff['price'])
     )
     await callback.answer()
 
