@@ -1,6 +1,6 @@
 # ==========================================================
 # Stopka VPN - Полноценный VPN сервис
-# Telegram Bot
+# Telegram Bot + Web Server (для Render)
 # ==========================================================
 
 import asyncio
@@ -1051,6 +1051,24 @@ async def error_handler(event, exception):
     return True
 
 ############################################################
+# WEB SERVER FOR RENDER HEALTH CHECK
+############################################################
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running", status=200)
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    app.router.add_get('/ping', handle_ping)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logging.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+
+############################################################
 # START BOT
 ############################################################
 
@@ -1058,6 +1076,10 @@ async def main():
     logging.info("🚀 Запуск Stopka VPN...")
     await set_commands()
 
+    # Запуск HTTP сервера для Render Health Check
+    await start_web_server()
+
+    # Фоновые задачи
     asyncio.create_task(check_payments())
     asyncio.create_task(subscription_notifications())
 
