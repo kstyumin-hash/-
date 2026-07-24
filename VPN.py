@@ -1,6 +1,6 @@
 # ==========================================================
 # Stopka VPN - Полноценный VPN сервис
-# Telegram Bot + Web Server (для Render) + DonationAlerts API
+# Telegram Bot + Web Server (для Render)
 # ==========================================================
 
 import asyncio
@@ -12,13 +12,10 @@ import os
 import html
 import io
 import time
-import uuid
-from urllib.parse import urlencode
 from collections import defaultdict
 from datetime import datetime, timedelta
 from aiohttp import web
 
-import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -42,16 +39,9 @@ from aiogram.utils.markdown import hbold
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬ_ТОКЕН")
 OWNER_ID = int(os.environ.get("OWNER_ID", 5604869107))
 
-# DonationAlerts
-DONATION_ACCESS_TOKEN = os.environ.get("DONATION_ACCESS_TOKEN", "")
-DONATION_SECRET_KEY = os.environ.get("DONATION_SECRET_KEY", "")
-DONATION_USERNAME = os.environ.get("DONATION_USERNAME", "your_da_username")
-DONATION_API_URL = "https://www.donationalerts.com/api/v1"
-
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.getenv("PORT", 8080))
 
-MAX_DAYS = 3650
 REFERRAL_DAYS = 7
 
 ############################################################
@@ -134,7 +124,7 @@ class Database:
         self.create_tables()
 
     def create_tables(self):
-        # Пользователи
+        # Пользователи (добавлено поле balance)
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id BIGINT PRIMARY KEY,
@@ -146,7 +136,8 @@ class Database:
             invited_by BIGINT DEFAULT 0,
             first_payment INTEGER DEFAULT 0,
             last_tariff TEXT,
-            username_history TEXT DEFAULT '[]'
+            username_history TEXT DEFAULT '[]',
+            balance INTEGER DEFAULT 0
         )
         """)
         
@@ -158,19 +149,6 @@ class Database:
             message TEXT,
             answer TEXT,
             status TEXT
-        )
-        """)
-        
-        # Платежи
-        self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS payments(
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            payment_code TEXT UNIQUE,
-            amount INTEGER,
-            days INTEGER,
-            status TEXT,
-            date TEXT
         )
         """)
         
@@ -213,14 +191,6 @@ class Database:
         )
         """)
         
-        # Обработанные донаты
-        self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS processed_donations(
-            donation_id TEXT PRIMARY KEY,
-            processed_at TEXT
-        )
-        """)
-        
         # Уведомления
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS notifications(
@@ -243,8 +213,8 @@ class Database:
         expire_str = expire.strftime("%Y-%m-%d 23:59:59")
         
         self.conn.execute("""
-            INSERT INTO users (id, username, name, expire_date, status, is_admin, invited_by, first_payment, last_tariff, username_history) 
-            VALUES(?,?,?,?,?,?,0,0,'',?)
+            INSERT INTO users (id, username, name, expire_date, status, is_admin, invited_by, first_payment, last_tariff, username_history, balance) 
+            VALUES(?,?,?,?,?,?,0,0,'',?, 0)
         """, (user_id, username, name, expire_str, "Активно", 0, json.dumps([])))
         self.conn.commit()
 
@@ -288,12 +258,9 @@ class Database:
         self.conn.execute("UPDATE users SET is_admin=? WHERE id=?", (1 if is_admin else 0, user_id))
         self.conn.commit()
 
-    def mark_first_payment(self, user_id):
-        self.conn.execute("UPDATE users SET first_payment=1 WHERE id=?", (user_id,))
-        self.conn.commit()
-
-    def save_last_tariff(self, user_id, tariff_id):
-        self.conn.execute("UPDATE users SET last_tariff=? WHERE id=?", (tariff_id, user_id))
+    def disable_subscription(self, user_id):
+        now_past = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+        self.conn.execute("UPDATE users SET expire_date=?, status='Отключено' WHERE id=?", (now_past, user_id))
         self.conn.commit()
 
     def get_referral_count(self, user_id):
@@ -332,17 +299,6 @@ class Database:
         )
         self.conn.commit()
 
-    def is_donation_processed(self, donation_id):
-        cursor = self.conn.execute("SELECT 1 FROM processed_donations WHERE donation_id=?", (str(donation_id),))
-        return cursor.fetchone() is not None
-
-    def mark_donation_processed(self, donation_id):
-        self.conn.execute(
-            "INSERT INTO processed_donations (donation_id, processed_at) VALUES(?,?)",
-            (str(donation_id), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        self.conn.commit()
-
     def add_admin_log(self, admin_id, action, target_id=0):
         self.conn.execute(
             """
@@ -364,6 +320,9 @@ class TicketState(StatesGroup):
 
 class AdminGiveState(StatesGroup):
     waiting_data = State()
+
+class AdminDisableState(StatesGroup):
+    waiting_username = State()
 
 class AdminToggleState(StatesGroup):
     waiting_username = State()
@@ -387,9 +346,9 @@ class PromoCreateState(StatesGroup):
 ############################################################
 
 TARIFFS = {
-    "month": {"name": "Месяц", "days": 30, "price": 180},
-    "half": {"name": "Полгода", "days": 180, "price": 980},
-    "year": {"name": "Год", "days": 365, "price": 1960}
+    "month": {"name": "месяц", "days": 30, "price": 150},
+    "half": {"name": "полгода", "days": 180, "price": 800},
+    "year": {"name": "год", "days": 365, "price": 1600}
 }
 
 ############################################################
@@ -403,16 +362,24 @@ def profile_keyboard(is_admin=False):
         [InlineKeyboardButton(text="🎁 Пригласить друга", callback_data="my_ref")],
         [InlineKeyboardButton(text="🎟 Промокод", callback_data="promo")]
     ]
+    # Админ-панель ВИДИТ ТОЛЬКО АДМИН
     if is_admin:
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def payment_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗓 Месяц — 180₽", callback_data="pay_month")],
-        [InlineKeyboardButton(text="📅 Полгода — 980₽", callback_data="pay_half")],
-        [InlineKeyboardButton(text="📆 Год — 1960₽", callback_data="pay_year")],
+        [InlineKeyboardButton(text="🗓 Месяц — 150₽", callback_data="pay_month")],
+        [InlineKeyboardButton(text="📅 Полгода — 800₽", callback_data="pay_half")],
+        [InlineKeyboardButton(text="📆 Год — 1600₽", callback_data="pay_year")],
         [InlineKeyboardButton(text="⬅ Назад", callback_data="profile")]
+    ])
+
+def manager_pay_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✈ Написать менеджеру", url="https://t.me/StopkaPayments_bot")],
+        [InlineKeyboardButton(text="📨 Открыть тикет в боте", callback_data="create_ticket")],
+        [InlineKeyboardButton(text="⬅ Назад в меню оплаты", callback_data="payment")]
     ])
 
 def back_keyboard():
@@ -425,19 +392,6 @@ def admin_back_keyboard():
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")]
     ])
 
-def donation_keyboard(code, amount):
-    # Автоматическое добавление параметров суммы и комментария к ссылке
-    params = {
-        "amount": amount,
-        "message": code
-    }
-    pay_url = f"https://www.donationalerts.com/r/{DONATION_USERNAME}?{urlencode(params)}"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Перейти к оплате", url=pay_url)],
-        [InlineKeyboardButton(text="🔎 Проверить оплату", callback_data=f"check_payment:{code}")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="payment")]
-    ])
-
 def support_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📨 Написать в поддержку", callback_data="create_ticket")]
@@ -445,11 +399,12 @@ def support_keyboard():
 
 def admin_keyboard():
     buttons = [
-        [InlineKeyboardButton(text="👥 Пришло пользователей", callback_data="users_count")],
+        [InlineKeyboardButton(text="🚫 Отключить подписку", callback_data="admin_disable")],
+        [InlineKeyboardButton(text="📅 Выдать дни подписки", callback_data="admin_give")],
+        [InlineKeyboardButton(text="👥 Статистика пользователей", callback_data="users_count")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")],
         [InlineKeyboardButton(text="🎟 Тикеты", callback_data="admin_tickets")],
         [InlineKeyboardButton(text="🎁 Промокоды", callback_data="promo_admin")],
-        [InlineKeyboardButton(text="📅 Выдать дни", callback_data="admin_give")],
         [InlineKeyboardButton(text="👑 Назначить/Удалить админа", callback_data="admin_toggle")],
         [InlineKeyboardButton(text="⬅ Главное меню", callback_data="profile")]
     ]
@@ -504,14 +459,19 @@ async def render_profile(user_id, target_message=None, callback=None):
     if expire < now:
         days = 0
 
-    expire_formatted = expire.strftime("%d.%m.%Y")
-    status_icon = "🟢" if days > 0 else "🔴"
-    safe_name = hbold(user[2] or "Пользователь")
+    vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
+    balance = user[10] if len(user) > 10 and user[10] is not None else 0
     
+    # Расчет по 5 руб/день (150₽ в месяц)
+    days_by_rubles = balance // 5
+
     text = (
-        f"👤 {safe_name}\n\n"
-        f"🛡 <b>Stopka VPN</b>\n\n"
-        f"{status_icon} Осталось: <b>{days} дней ({expire_formatted})</b>"
+        f"<b>Stopka VPN🛡️</b>\n\n"
+        f"😎 <b>Мой профиль</b>\n"
+        f"┌ 🆔 ID: <code>{user_id}</code>\n"
+        f"├ ⭐ Подписка: <b>Premium</b>\n"
+        f"├ 💳 Баланс: <b>{balance} ₽</b> (хватит на ≈{days_by_rubles} дней)\n"
+        f"└ 🔑 VPN: <b>{vpn_status}</b>"
     )
     
     is_admin = db.is_admin(user_id)
@@ -522,51 +482,6 @@ async def render_profile(user_id, target_message=None, callback=None):
         await callback.answer()
     elif target_message:
         await target_message.answer(text, reply_markup=kb)
-
-async def process_successful_payment(user_id, payment_code, amount, days):
-    user = db.get_user(user_id)
-    if not user:
-        return False
-
-    try:
-        expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
-    except:
-        expire = datetime.now()
-
-    now = datetime.now()
-    if expire < now:
-        expire = now
-
-    new_expire = expire + timedelta(days=days)
-    new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
-
-    # Обновление подписки
-    db.conn.execute("UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (new_expire_str, user_id))
-    db.conn.execute("UPDATE payments SET status='paid' WHERE payment_code=?", (payment_code,))
-    
-    # Проверка первого платежа и выдача бонуса пригласившему
-    if user[7] == 0:
-        db.mark_first_payment(user_id)
-        invited_by = user[6]
-        if invited_by and invited_by != 0:
-            inviter = db.get_user(invited_by)
-            if inviter:
-                try:
-                    inv_expire = datetime.strptime(inviter[3], "%Y-%m-%d %H:%M:%S")
-                except:
-                    inv_expire = datetime.now()
-                if inv_expire < now:
-                    inv_expire = now
-                inv_new_expire = inv_expire + timedelta(days=REFERRAL_DAYS)
-                db.conn.execute("UPDATE users SET expire_date=? WHERE id=?", (inv_new_expire.strftime("%Y-%m-%d 23:59:59"), invited_by))
-                db.conn.execute("UPDATE referrals SET bonus_given=1 WHERE user_id=?", (user_id,))
-                try:
-                    await bot.send_message(invited_by, f"🎁 Твой реферал оплатил подписку! Тебе начислено +{REFERRAL_DAYS} дней VPN.")
-                except:
-                    pass
-
-    db.conn.commit()
-    return True
 
 ############################################################
 # COMMANDS: START, HELP, ABOUT
@@ -655,91 +570,16 @@ async def process_pay(callback: CallbackQuery):
         await callback.answer("Ошибка выбора тарифа", show_alert=True)
         return
 
-    db.save_last_tariff(callback.from_user.id, tariff_id)
-    
-    def create_payment_code():
-        return f"STOPKA-{uuid.uuid4().hex[:8].upper()}"
-
-    code = create_payment_code()
-    try:
-        db.conn.execute("""
-            INSERT INTO payments (user_id, payment_code, amount, days, status, date)
-            VALUES(?,?,?,?,?,?)
-        """, (callback.from_user.id, code, tariff['price'], tariff['days'], "waiting", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        db.conn.commit()
-    except IntegrityError:
-        code = create_payment_code()
-        db.conn.execute("""
-            INSERT INTO payments (user_id, payment_code, amount, days, status, date)
-            VALUES(?,?,?,?,?,?)
-        """, (callback.from_user.id, code, tariff['price'], tariff['days'], "waiting", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        db.conn.commit()
+    msg_to_copy = f"Здравствуйте! Я по поводу оплаты ({tariff['name']}) за {tariff['price']} ₽"
 
     await callback.message.edit_text(
-        f"💳 <b>Оплата Stopka VPN</b>\n\n"
-        f"Тариф: <b>{tariff['name']}</b> (+{tariff['days']} дней)\n"
-        f"Сумма к оплате: <b>{tariff['price']} ₽</b>\n\n"
-        f"📌 Ваш код оплаты:\n<code>{code}</code>\n\n"
-        f"<b>Инструкция:</b>\n"
-        f"1. Нажмите «Перейти к оплате» ниже.\n"
-        f"2. Сумма и комментарий заплатятся автоматически.\n"
-        f"3. После перевода нажмите «Проверить оплату».",
-        reply_markup=donation_keyboard(code, tariff['price'])
+        f"💳 <b>Оплата тарифного плана</b>\n\n"
+        f"Для оплаты напишите менеджеру в @StopkaPayments_bot или откройте тикет прямо в боте.\n\n"
+        f"📌 <b>Скопируйте и отправьте это сообщение:</b>\n"
+        f"<code>{msg_to_copy}</code>",
+        reply_markup=manager_pay_keyboard()
     )
     await callback.answer()
-
-@dp.callback_query(F.data.startswith("check_payment:"))
-async def check_payment_callback(callback: CallbackQuery):
-    code = callback.data.split(":")[1]
-    payment = db.conn.execute("SELECT * FROM payments WHERE payment_code=?", (code,)).fetchone()
-    
-    if not payment:
-        await callback.answer("❌ Платеж не найден.", show_alert=True)
-        return
-
-    if payment[5] == "paid":
-        await callback.answer("✅ Этот платеж уже успешно обработан!", show_alert=True)
-        await render_profile(callback.from_user.id, callback=callback)
-        return
-
-    if not DONATION_ACCESS_TOKEN:
-        await callback.answer("⚠️ API токен DonationAlerts не настроен администратором.", show_alert=True)
-        return
-
-    # Запрос к DonationAlerts API
-    headers = {"Authorization": f"Bearer {DONATION_ACCESS_TOKEN}"}
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(f"{DONATION_API_URL}/alerts/donations", headers=headers) as resp:
-                if resp.status != 200:
-                    await callback.answer("⚠️ Ошибка подключения к DonationAlerts API", show_alert=True)
-                    return
-                
-                data = await resp.json()
-                donations = data.get("data", [])
-                
-                found = False
-                for don in donations:
-                    don_id = don.get("id")
-                    message_text = don.get("message", "")
-                    amount = float(don.get("amount", 0))
-
-                    if code in message_text and amount >= payment[3]:
-                        if not db.is_donation_processed(don_id):
-                            db.mark_donation_processed(don_id)
-                            await process_successful_payment(payment[1], code, payment[3], payment[4])
-                            found = True
-                            break
-
-                if found:
-                    await callback.answer("🎉 Оплата успешно подтверждена! Подписка продлена.", show_alert=True)
-                    await render_profile(callback.from_user.id, callback=callback)
-                else:
-                    await callback.answer("❌ Платеж с таким кодом не найден. Проверьте комментарий и повторите через минуту.", show_alert=True)
-
-        except Exception as e:
-            logging.error(f"Ошибка проверки оплаты: {e}")
-            await callback.answer("❌ Ошибка при проверке. Попробуйте чуть позже.", show_alert=True)
 
 ############################################################
 # REFERRAL & PROMO
@@ -826,7 +666,7 @@ async def promo_use(message: Message, state: FSMContext):
 async def create_ticket(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TicketState.waiting_text)
     await callback.message.edit_text(
-        "📝 Опишите вашу проблему в одном сообщении:",
+        "📝 Опишите вашу проблему или напишите по поводу оплаты в одном сообщении:",
         reply_markup=back_keyboard()
     )
     await callback.answer()
@@ -850,7 +690,7 @@ async def process_ticket(message: Message, state: FSMContext):
 async def admin_panel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if not db.is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа", show_alert=True)
+        await callback.answer("❌ Нет доступа. Вы не администратор!", show_alert=True)
         return
 
     await callback.message.edit_text(
@@ -858,6 +698,43 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
         reply_markup=admin_keyboard()
     )
     await callback.answer()
+
+@dp.callback_query(F.data == "admin_disable")
+async def admin_disable_start(callback: CallbackQuery, state: FSMContext):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminDisableState.waiting_username)
+    await callback.message.edit_text(
+        "🚫 <b>Отключение подписки</b>\n\n"
+        "Введите `@username` или `ID` пользователя, у которого нужно отключить подписку:",
+        reply_markup=admin_back_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminDisableState.waiting_username)
+async def admin_disable_finish(message: Message, state: FSMContext):
+    if not db.is_admin(message.from_user.id):
+        return
+
+    user_input = message.text.strip()
+    user = db.get_username(user_input)
+
+    if not user:
+        await message.answer("❌ Пользователь не найден", reply_markup=admin_back_keyboard())
+        await state.clear()
+        return
+
+    db.disable_subscription(user[0])
+    db.add_admin_log(message.from_user.id, "Отключил подписку", user[0])
+
+    try:
+        await bot.send_message(user[0], "❌ Ваша подписка Stopka VPN была отключена администратором.")
+    except:
+        pass
+
+    await state.clear()
+    await message.answer(f"✅ Подписка для пользователя {user[1] or user[0]} успешно отключена!", reply_markup=admin_back_keyboard())
 
 @dp.callback_query(F.data == "users_count")
 async def users_count(callback: CallbackQuery):
@@ -867,7 +744,7 @@ async def users_count(callback: CallbackQuery):
     total = db.get_total_users_count()
     await callback.message.edit_text(
         f"👥 <b>Статистика пользователей</b>\n\n"
-        f"Всего пришло пользователей: <b>{total}</b>",
+        f"Всего пользователей: <b>{total}</b>",
         reply_markup=admin_back_keyboard()
     )
     await callback.answer()
@@ -880,7 +757,7 @@ async def admin_toggle_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminToggleState.waiting_username)
     await callback.message.edit_text(
         "👑 <b>Назначить / Удалить админа</b>\n\n"
-        "Введите `@username` или `ID` пользователя.\n"
+        "Введите `@username` или `ID` пользователя:\n"
         "Если пользователь админ — статус заберётся, если не админ — выдастся.",
         reply_markup=admin_back_keyboard()
     )
@@ -1115,44 +992,8 @@ async def broadcast_finish(message: Message, state: FSMContext):
     await message.answer(f"✅ Рассылка завершена! Доставлено {count} пользователям.", reply_markup=admin_back_keyboard())
 
 ############################################################
-# CHECK PAYMENTS & NOTIFICATIONS TASK
+# NOTIFICATIONS TASK
 ############################################################
-
-async def check_payments():
-    """Фоновая автоматическая проверка всех незавершенных платежей"""
-    while True:
-        try:
-            if DONATION_ACCESS_TOKEN:
-                waiting_payments = db.conn.execute("SELECT user_id, payment_code, amount, days FROM payments WHERE status='waiting'").fetchall()
-                if waiting_payments:
-                    headers = {"Authorization": f"Bearer {DONATION_ACCESS_TOKEN}"}
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(f"{DONATION_API_URL}/alerts/donations", headers=headers) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                donations = data.get("data", [])
-                                for don in donations:
-                                    don_id = don.get("id")
-                                    message_text = don.get("message", "")
-                                    amount = float(don.get("amount", 0))
-
-                                    for p in waiting_payments:
-                                        p_user_id, p_code, p_amount, p_days = p
-                                        if p_code in message_text and amount >= p_amount:
-                                            if not db.is_donation_processed(don_id):
-                                                db.mark_donation_processed(don_id)
-                                                success = await process_successful_payment(p_user_id, p_code, p_amount, p_days)
-                                                if success:
-                                                    try:
-                                                        await bot.send_message(
-                                                            p_user_id,
-                                                            f"🎉 <b>Оплата получена!</b>\n\nВам зачислено +{p_days} дней VPN."
-                                                        )
-                                                    except:
-                                                        pass
-        except Exception as e:
-            logging.error(f"Ошибка фоновой проверки платежей: {e}")
-        await asyncio.sleep(30)
 
 async def subscription_notifications():
     while True:
@@ -1217,7 +1058,6 @@ async def main():
     await start_web_server()
 
     # Фоновые задачи
-    asyncio.create_task(check_payments())
     asyncio.create_task(subscription_notifications())
 
     logging.info("✅ Stopka VPN запущен успешно!")
