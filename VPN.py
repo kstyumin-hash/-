@@ -377,7 +377,6 @@ def payment_keyboard():
 def manager_pay_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✈ Написать менеджеру", url="https://t.me/StopkaPayments_bot")],
-        [InlineKeyboardButton(text="📨 Открыть тикет в боте", callback_data="create_ticket")],
         [InlineKeyboardButton(text="⬅ Назад в меню оплаты", callback_data="payment")]
     ])
 
@@ -456,7 +455,7 @@ async def render_profile(user_id, target_message=None, callback=None):
     now = datetime.now()
     if expire > now:
         delta = expire - now
-        # Точный расчет дней с округлением вверх/до ближайшего
+        # Точный расчет дней с округлением
         days = max(1, int(round(delta.total_seconds() / 86400)))
     else:
         days = 0
@@ -571,7 +570,6 @@ async def process_pay(callback: CallbackQuery):
         await callback.answer("Ошибка выбора тарифа", show_alert=True)
         return
 
-    # Фраза без скобок вокруг тарифного периода
     msg_to_copy = f"Здравствуйте! Я по поводу оплаты {tariff['name']} за {tariff['price']} ₽"
 
     await callback.message.edit_text(
