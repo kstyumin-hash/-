@@ -124,7 +124,7 @@ class Database:
         self.create_tables()
 
     def create_tables(self):
-        # Пользователи (добавлено поле balance)
+        # Пользователи
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id BIGINT PRIMARY KEY,
@@ -362,7 +362,6 @@ def profile_keyboard(is_admin=False):
         [InlineKeyboardButton(text="🎁 Пригласить друга", callback_data="my_ref")],
         [InlineKeyboardButton(text="🎟 Промокод", callback_data="promo")]
     ]
-    # Админ-панель ВИДИТ ТОЛЬКО АДМИН
     if is_admin:
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -455,23 +454,25 @@ async def render_profile(user_id, target_message=None, callback=None):
             expire = datetime.now()
     
     now = datetime.now()
-    days = (expire - now).days
-    if expire < now:
+    if expire > now:
+        delta = expire - now
+        # Точный расчет дней с округлением вверх/до ближайшего
+        days = max(1, int(round(delta.total_seconds() / 86400)))
+    else:
         days = 0
 
     vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
-    balance = user[10] if len(user) > 10 and user[10] is not None else 0
     
-    # Расчет по 5 руб/день (150₽ в месяц)
-    days_by_rubles = balance // 5
+    # Расчет баланса: 150₽ за 30 дней = 5₽/день
+    balance = days * 5
 
     text = (
-        f"<b>Stopka VPN🛡️</b>\n\n"
-        f"😎 <b>Мой профиль</b>\n"
-        f"┌ 🆔 ID: <code>{user_id}</code>\n"
-        f"├ ⭐ Подписка: <b>Premium</b>\n"
-        f"├ 💳 Баланс: <b>{balance} ₽</b> (хватит на ≈{days_by_rubles} дней)\n"
-        f"└ 🔑 VPN: <b>{vpn_status}</b>"
+        f"Stopka VPN🛡️\n\n"
+        f"😎 Мой профиль\n"
+        f"┌ 🆔 ID:  {user_id}\n"
+        f"├ ⭐ Подписка: Premium\n"
+        f"├ 💳 Баланс: {balance} ₽ хватит на ≈{days} дней\n"
+        f"└ 🔑 VPN: {vpn_status}"
     )
     
     is_admin = db.is_admin(user_id)
@@ -570,12 +571,13 @@ async def process_pay(callback: CallbackQuery):
         await callback.answer("Ошибка выбора тарифа", show_alert=True)
         return
 
-    msg_to_copy = f"Здравствуйте! Я по поводу оплаты ({tariff['name']}) за {tariff['price']} ₽"
+    # Фраза без скобок вокруг тарифного периода
+    msg_to_copy = f"Здравствуйте! Я по поводу оплаты {tariff['name']} за {tariff['price']} ₽"
 
     await callback.message.edit_text(
         f"💳 <b>Оплата тарифного плана</b>\n\n"
-        f"Для оплаты напишите менеджеру в @StopkaPayments_bot или откройте тикет прямо в боте.\n\n"
-        f"📌 <b>Скопируйте и отправьте это сообщение:</b>\n"
+        f"Для оплаты откройте тикет у нашего менеджера в @StopkaPayments_bot.\n\n"
+        f"📌 <b>Откройте тикет и напишите ему это сообщение:</b>\n"
         f"<code>{msg_to_copy}</code>",
         reply_markup=manager_pay_keyboard()
     )
