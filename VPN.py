@@ -215,7 +215,8 @@ class Database:
         self.conn.execute("""
             INSERT INTO users (id, username, name, expire_date, status, is_admin, invited_by, first_payment, last_tariff, username_history, balance) 
             VALUES(?,?,?,?,?,?,0,0,'',?, 0)
-        """, (user_id, username, name, expire_str, "Активно", 0, json.dumps([])))
+            ON CONFLICT (id) DO NOTHING
+        """, (user_id, username or "", name or "", expire_str, "Активно", 0, json.dumps([])))
         self.conn.commit()
 
     def get_user(self, user_id):
@@ -235,7 +236,10 @@ class Database:
         user = self.get_user(user_id)
         if not user:
             return
-        history = json.loads(user[9] or '[]')
+        try:
+            history = json.loads(user[9] or '[]')
+        except:
+            history = []
         history.append({
             "username": new_username,
             "date": datetime.now().isoformat()
@@ -279,7 +283,7 @@ class Database:
         return cursor.fetchone() is not None
 
     def mark_promo_used(self, user_id, code):
-        self.conn.execute("INSERT INTO used_promos (user_id, code) VALUES(?,?)", (user_id, code))
+        self.conn.execute("INSERT INTO used_promos (user_id, code) VALUES(?,?) ON CONFLICT DO NOTHING", (user_id, code))
         self.conn.commit()
 
     def notification_sent(self, user_id, ntype):
@@ -440,9 +444,17 @@ async def rate_limit_middleware(handler, message: Message, data: dict):
 async def render_profile(user_id, target_message=None, callback=None):
     user = db.get_user(user_id)
     if not user:
-        if callback:
-            await callback.answer("Ошибка пользователя", show_alert=True)
-        return
+        if target_message:
+            # Если пользователя нет, пробуем добавить повторно
+            db.add_user(user_id, target_message.from_user.username or "", target_message.from_user.full_name)
+            user = db.get_user(user_id)
+        
+        if not user:
+            if callback:
+                await callback.answer("Ошибка пользователя", show_alert=True)
+            elif target_message:
+                await target_message.answer("❌ Ошибка загрузки профиля. Попробуйте еще раз /start")
+            return
 
     try:
         expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
@@ -455,7 +467,6 @@ async def render_profile(user_id, target_message=None, callback=None):
     now = datetime.now()
     if expire > now:
         delta = expire - now
-        # Точный расчет дней с округлением
         days = max(1, int(round(delta.total_seconds() / 86400)))
     else:
         days = 0
@@ -490,14 +501,15 @@ async def render_profile(user_id, target_message=None, callback=None):
 @dp.message(Command("start"))
 async def start(message: Message):
     user_id = message.from_user.id
+    username = message.from_user.username or ""
     
     user = db.get_user(user_id)
-    if user and user[1] != message.from_user.username:
-        db.update_username(user_id, message.from_user.username or "")
+    if user and (user[1] or "") != username:
+        db.update_username(user_id, username)
     
     db.add_user(
         user_id,
-        message.from_user.username or "",
+        username,
         message.from_user.full_name
     )
     
@@ -516,10 +528,10 @@ async def start(message: Message):
                     existing = cursor.fetchone()
                     if existing and existing[0] == 0:
                         db.conn.execute("UPDATE users SET invited_by=? WHERE id=?", (inviter, user_id))
-                        db.conn.execute("INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0)", (user_id, inviter))
+                        db.conn.execute("INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0) ON CONFLICT (user_id) DO NOTHING", (user_id, inviter))
                         db.conn.commit()
-            except:
-                pass
+            except Exception as e:
+                logging.error(f"Ошибка обработки реферала: {e}")
     
     await render_profile(user_id, target_message=message)
 
@@ -958,7 +970,7 @@ async def promo_create_finish(message: Message, state: FSMContext):
         max_uses = int(message.text)
         data = await state.get_data()
         db.conn.execute(
-            "INSERT INTO promo_codes (code, days, uses, max_uses) VALUES(?,?,0,?)",
+            "INSERT INTO promo_codes (code, days, uses, max_uses) VALUES(?,?,0,?) ON CONFLICT DO NOTHING",
             (data['code'], data['days'], max_uses)
         )
         db.conn.commit()
