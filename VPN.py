@@ -7,11 +7,13 @@ import asyncio
 import logging
 import psycopg2
 import psycopg2.errorcodes
+import psycopg2.extensions as ext
 import json
 import os
 import html
 import io
 import time
+import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -30,7 +32,6 @@ from aiogram.types import (
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.utils.markdown import hbold
 
 ############################################################
 # НАСТРОЙКИ
@@ -98,20 +99,33 @@ IntegrityError = psycopg2.errors.lookup(psycopg2.errorcodes.UNIQUE_VIOLATION)
 class PGConnection:
     def __init__(self, dsn):
         self._conn = psycopg2.connect(dsn)
-        self._conn.autocommit = False
+        self._conn.autocommit = True  # Включаем autocommit для избежания залипших транзакций
 
     def execute(self, query, params=()):
+        # Проверка и сброс транзакции в случае ошибки
+        try:
+            if self._conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
+                self._conn.rollback()
+        except Exception:
+            pass
+
         pg_query = query.replace("?", "%s")
         cur = self._conn.cursor()
         try:
             cur.execute(pg_query, params)
         except Exception:
-            self._conn.rollback()
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
             raise
         return cur
 
     def commit(self):
-        self._conn.commit()
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
 
 class Database:
     def __init__(self):
@@ -214,9 +228,9 @@ class Database:
         
         self.conn.execute("""
             INSERT INTO users (id, username, name, expire_date, status, is_admin, invited_by, first_payment, last_tariff, username_history, balance) 
-            VALUES(?,?,?,?,?,?,0,0,'',?, 0)
+            VALUES(?,?,?,?,?,0,0,0,'',?,0)
             ON CONFLICT (id) DO NOTHING
-        """, (user_id, username or "", name or "", expire_str, "Активно", 0, json.dumps([])))
+        """, (user_id, username or "", name or "", expire_str, "Активно", json.dumps([])))
         self.conn.commit()
 
     def get_user(self, user_id):
@@ -445,7 +459,6 @@ async def render_profile(user_id, target_message=None, callback=None):
     user = db.get_user(user_id)
     if not user:
         if target_message:
-            # Если пользователя нет, пробуем добавить повторно
             db.add_user(user_id, target_message.from_user.username or "", target_message.from_user.full_name)
             user = db.get_user(user_id)
         
@@ -473,7 +486,6 @@ async def render_profile(user_id, target_message=None, callback=None):
 
     vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
     
-    # Расчет баланса: 150₽ за 30 дней = 5₽/день
     balance = days * 5
 
     text = (
@@ -516,7 +528,6 @@ async def start(message: Message):
     if user_id == OWNER_ID:
         db.set_admin(user_id, True)
     
-    # Проверка реферала
     args = message.text.split()
     if len(args) > 1:
         ref = args[1]
@@ -1037,7 +1048,14 @@ async def set_commands():
 
 @dp.error()
 async def error_handler(event, exception):
-    logging.error(f"Ошибка: {exception}")
+    logging.error("Необработанная ошибка:\n" + "".join(
+        traceback.format_exception(type(exception), exception, exception.__traceback__)
+    ))
+    try:
+        if event.update and event.update.message:
+            await event.update.message.answer("⚠️ Произошла ошибка, попробуйте ещё раз /start")
+    except Exception:
+        pass
     return True
 
 ############################################################
