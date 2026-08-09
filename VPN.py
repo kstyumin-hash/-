@@ -98,28 +98,48 @@ IntegrityError = psycopg2.errors.lookup(psycopg2.errorcodes.UNIQUE_VIOLATION)
 
 class PGConnection:
     def __init__(self, dsn):
-        self._conn = psycopg2.connect(dsn)
-        self._conn.autocommit = True  # Включаем autocommit для избежания залипших транзакций
+        self._dsn = dsn
+        self._conn = self._connect()
+
+    def _connect(self):
+        conn = psycopg2.connect(
+            self._dsn,
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
+        conn.autocommit = True
+        return conn
 
     def execute(self, query, params=()):
-        # Проверка и сброс транзакции в случае ошибки
-        try:
-            if self._conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
-                self._conn.rollback()
-        except Exception:
-            pass
-
         pg_query = query.replace("?", "%s")
-        cur = self._conn.cursor()
         try:
+            if self._conn.closed:
+                self._conn = self._connect()
+            elif self._conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
+                self._conn.rollback()
+            
+            cur = self._conn.cursor()
             cur.execute(pg_query, params)
+            return cur
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # Если соединение разорвано/отвалилось по таймауту, переподключаемся и повторно пробуем
+            logging.warning("⚠️ Потеряно соединение с PostgreSQL. Выполняется переподключение...")
+            try:
+                self._conn = self._connect()
+                cur = self._conn.cursor()
+                cur.execute(pg_query, params)
+                return cur
+            except Exception:
+                raise
         except Exception:
             try:
                 self._conn.rollback()
             except Exception:
                 pass
             raise
-        return cur
 
     def commit(self):
         try:
@@ -515,6 +535,8 @@ async def start(message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or ""
     
+    logging.info(f"➡️ /start от user_id={user_id} username={username}")
+
     user = db.get_user(user_id)
     if user and (user[1] or "") != username:
         db.update_username(user_id, username)
@@ -1089,6 +1111,9 @@ async def main():
 
     # Фоновые задачи
     asyncio.create_task(subscription_notifications())
+
+    # Сброс вебхука и удаление зависших обновлений
+    await bot.delete_webhook(drop_pending_updates=True)
 
     logging.info("✅ Stopka VPN запущен успешно!")
     await dp.start_polling(bot)
