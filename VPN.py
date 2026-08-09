@@ -27,7 +27,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BotCommand
+    BotCommand,
+    ErrorEvent
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -125,7 +126,6 @@ class PGConnection:
             cur.execute(pg_query, params)
             return cur
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            # Если соединение разорвано/отвалилось по таймауту, переподключаемся и повторно пробуем
             logging.warning("⚠️ Потеряно соединение с PostgreSQL. Выполняется переподключение...")
             try:
                 self._conn = self._connect()
@@ -158,6 +158,12 @@ class Database:
         self.create_tables()
 
     def create_tables(self):
+        # Авто-миграция: добавляем колонку balance, если её еще нет в таблице
+        try:
+            self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER DEFAULT 0;")
+        except Exception as e:
+            logging.warning(f"Ошибка при выполнении миграции balance: {e}")
+
         # Пользователи
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
@@ -1069,7 +1075,8 @@ async def set_commands():
     await bot.set_my_commands(commands)
 
 @dp.error()
-async def error_handler(event, exception):
+async def error_handler(event: ErrorEvent):
+    exception = event.exception
     logging.error("Необработанная ошибка:\n" + "".join(
         traceback.format_exception(type(exception), exception, exception.__traceback__)
     ))
