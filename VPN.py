@@ -28,7 +28,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BotCommand,
-    ErrorEvent
+    ErrorEvent,
+    LabeledPrice,
+    PreCheckoutQuery
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -158,13 +160,11 @@ class Database:
         self.create_tables()
 
     def create_tables(self):
-        # Авто-миграция: добавляем колонку balance, если её еще нет в таблице
         try:
             self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER DEFAULT 0;")
         except Exception as e:
             logging.warning(f"Ошибка при выполнении миграции balance: {e}")
 
-        # Пользователи
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id BIGINT PRIMARY KEY,
@@ -181,7 +181,6 @@ class Database:
         )
         """)
         
-        # Тикеты
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS tickets(
             id SERIAL PRIMARY KEY,
@@ -192,7 +191,6 @@ class Database:
         )
         """)
         
-        # Промокоды
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes(
             code TEXT PRIMARY KEY,
@@ -202,7 +200,6 @@ class Database:
         )
         """)
 
-        # Использованные промокоды
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS used_promos(
             user_id BIGINT,
@@ -211,7 +208,6 @@ class Database:
         )
         """)
         
-        # Рефералы
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS referrals(
             user_id BIGINT PRIMARY KEY,
@@ -220,7 +216,6 @@ class Database:
         )
         """)
         
-        # Логи админов
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS admin_logs(
             id SERIAL PRIMARY KEY,
@@ -231,7 +226,6 @@ class Database:
         )
         """)
         
-        # Уведомления
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS notifications(
             user_id BIGINT,
@@ -371,6 +365,9 @@ class AdminDisableState(StatesGroup):
 class AdminToggleState(StatesGroup):
     waiting_username = State()
 
+class AdminProfileState(StatesGroup):
+    waiting_username = State()
+
 class ReplyState(StatesGroup):
     waiting_answer = State()
 
@@ -390,9 +387,9 @@ class PromoCreateState(StatesGroup):
 ############################################################
 
 TARIFFS = {
-    "month": {"name": "месяц", "days": 30, "price": 150},
-    "half": {"name": "полгода", "days": 180, "price": 800},
-    "year": {"name": "год", "days": 365, "price": 1600}
+    "month": {"name": "месяц", "days": 30, "price": 150, "stars": 75},
+    "half": {"name": "полгода", "days": 180, "price": 800, "stars": 400},
+    "year": {"name": "год", "days": 365, "price": 1600, "stars": 800}
 }
 
 ############################################################
@@ -410,18 +407,33 @@ def profile_keyboard(is_admin=False):
         buttons.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def payment_keyboard():
+def payment_method_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐️ Telegram Stars", callback_data="pay_type_stars")],
+        [InlineKeyboardButton(text="💳 Любой картой", callback_data="pay_type_card")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="profile")]
+    ])
+
+def stars_payment_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗓 Месяц — {TARIFFS['month']['stars']} ⭐️", callback_data="stars_month")],
+        [InlineKeyboardButton(text=f"📅 Полгода — {TARIFFS['half']['stars']} ⭐️", callback_data="stars_half")],
+        [InlineKeyboardButton(text=f"📆 Год — {TARIFFS['year']['stars']} ⭐️", callback_data="stars_year")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="payment")]
+    ])
+
+def card_payment_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗓 Месяц — 150₽", callback_data="pay_month")],
         [InlineKeyboardButton(text="📅 Полгода — 800₽", callback_data="pay_half")],
         [InlineKeyboardButton(text="📆 Год — 1600₽", callback_data="pay_year")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="profile")]
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="payment")]
     ])
 
 def manager_pay_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✈ Написать менеджеру", url="https://t.me/StopkaPayments_bot")],
-        [InlineKeyboardButton(text="⬅ Назад в меню оплаты", callback_data="payment")]
+        [InlineKeyboardButton(text="⬅ Назад в меню оплаты", callback_data="pay_type_card")]
     ])
 
 def back_keyboard():
@@ -441,6 +453,7 @@ def support_keyboard():
 
 def admin_keyboard():
     buttons = [
+        [InlineKeyboardButton(text="👤 Просмотр профиля", callback_data="admin_view_profile")],
         [InlineKeyboardButton(text="🚫 Отключить подписку", callback_data="admin_disable")],
         [InlineKeyboardButton(text="📅 Выдать дни подписки", callback_data="admin_give")],
         [InlineKeyboardButton(text="👥 Статистика пользователей", callback_data="users_count")],
@@ -481,6 +494,35 @@ async def rate_limit_middleware(handler, message: Message, data: dict):
 # HELPER FUNCTIONS
 ############################################################
 
+def build_profile_text(user_id, user_data):
+    try:
+        expire = datetime.strptime(user_data[3], "%Y-%m-%d %H:%M:%S")
+    except:
+        try:
+            expire = datetime.strptime(user_data[3], "%Y-%m-%d")
+        except:
+            expire = datetime.now()
+    
+    now = datetime.now()
+    if expire > now:
+        delta = expire - now
+        days = max(1, int(round(delta.total_seconds() / 86400)))
+    else:
+        days = 0
+
+    vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
+    balance = days * 5
+
+    text = (
+        f"Stopka VPN🛡️\n\n"
+        f"😎 Мой профиль\n"
+        f"┌ 🆔 ID:  {user_id}\n"
+        f"├ ⭐ Подписка: Premium\n"
+        f"├ 💳 Баланс: {balance} ₽ хватит на ≈{days} дней\n"
+        f"└ 🔑 VPN: {vpn_status}"
+    )
+    return text
+
 async def render_profile(user_id, target_message=None, callback=None):
     user = db.get_user(user_id)
     if not user:
@@ -495,34 +537,7 @@ async def render_profile(user_id, target_message=None, callback=None):
                 await target_message.answer("❌ Ошибка загрузки профиля. Попробуйте еще раз /start")
             return
 
-    try:
-        expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
-    except:
-        try:
-            expire = datetime.strptime(user[3], "%Y-%m-%d")
-        except:
-            expire = datetime.now()
-    
-    now = datetime.now()
-    if expire > now:
-        delta = expire - now
-        days = max(1, int(round(delta.total_seconds() / 86400)))
-    else:
-        days = 0
-
-    vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
-    
-    balance = days * 5
-
-    text = (
-        f"Stopka VPN🛡️\n\n"
-        f"😎 Мой профиль\n"
-        f"┌ 🆔 ID:  {user_id}\n"
-        f"├ ⭐ Подписка: Premium\n"
-        f"├ 💳 Баланс: {balance} ₽ хватит на ≈{days} дней\n"
-        f"└ 🔑 VPN: {vpn_status}"
-    )
-    
+    text = build_profile_text(user_id, user)
     is_admin = db.is_admin(user_id)
     kb = profile_keyboard(is_admin)
 
@@ -605,11 +620,28 @@ async def connect_device(callback: CallbackQuery):
 ############################################################
 
 @dp.callback_query(F.data == "payment")
-async def payment(callback: CallbackQuery):
+async def payment_method_select(callback: CallbackQuery):
     await callback.message.edit_text(
-        "💳 <b>Выберите тарифный план:</b>\n\n"
+        "💳 <b>Выберите способ оплаты:</b>",
+        reply_markup=payment_method_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "pay_type_card")
+async def payment_card_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "💳 <b>Выберите тарифный план (Оплата картой):</b>\n\n"
         "При покупке дни автоматически добавятся к вашей текущей подписке.",
-        reply_markup=payment_keyboard()
+        reply_markup=card_payment_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "pay_type_stars")
+async def payment_stars_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "⭐️ <b>Выберите тарифный план (Оплата Telegram Stars):</b>\n\n"
+        "Оплата произойдет мгновенно прямо в Telegram!",
+        reply_markup=stars_payment_keyboard()
     )
     await callback.answer()
 
@@ -631,6 +663,69 @@ async def process_pay(callback: CallbackQuery):
         reply_markup=manager_pay_keyboard()
     )
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("stars_"))
+async def process_stars_pay(callback: CallbackQuery):
+    tariff_id = callback.data.split("_")[1]
+    tariff = TARIFFS.get(tariff_id)
+    if not tariff:
+        await callback.answer("Ошибка выбора тарифа", show_alert=True)
+        return
+
+    prices = [LabeledPrice(label=f"Подписка Stopka VPN ({tariff['name']})", amount=tariff["stars"])]
+
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"Подписка Stopka VPN — {tariff['name'].capitalize()}",
+        description=f"Продление подписки VPN на {tariff['days']} дней",
+        payload=f"stars_{tariff_id}_{callback.from_user.id}_{int(time.time())}",
+        provider_token="",
+        currency="XTR",
+        prices=prices
+    )
+    await callback.answer()
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    user_id = message.from_user.id
+    
+    if payload.startswith("stars_"):
+        parts = payload.split("_")
+        tariff_id = parts[1]
+        tariff = TARIFFS.get(tariff_id)
+        if tariff:
+            days = tariff["days"]
+            user = db.get_user(user_id)
+            if user:
+                try:
+                    expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+                except:
+                    try:
+                        expire = datetime.strptime(user[3], "%Y-%m-%d")
+                    except:
+                        expire = datetime.now()
+                
+                now = datetime.now()
+                if expire < now:
+                    expire = now
+                
+                new_expire = expire + timedelta(days=days)
+                new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
+                
+                db.conn.execute("UPDATE users SET expire_date=?, status='Активно', last_tariff=? WHERE id=?", (new_expire_str, tariff['name'], user_id))
+                db.conn.commit()
+                
+                await message.answer(
+                    f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+                    f"Вам добавлено <b>+{days} дней</b> подписки.\n"
+                    f"Подписка активна до: <b>{new_expire_str}</b>",
+                    reply_markup=back_keyboard()
+                )
 
 ############################################################
 # REFERRAL & PROMO
@@ -749,6 +844,48 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
         reply_markup=admin_keyboard()
     )
     await callback.answer()
+
+@dp.callback_query(F.data == "admin_view_profile")
+async def admin_view_profile_start(callback: CallbackQuery, state: FSMContext):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminProfileState.waiting_username)
+    await callback.message.edit_text(
+        "👤 <b>Просмотр профиля пользователя</b>\n\n"
+        "Введите `@username` или `ID` пользователя:",
+        reply_markup=admin_back_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminProfileState.waiting_username)
+async def admin_view_profile_finish(message: Message, state: FSMContext):
+    if not db.is_admin(message.from_user.id):
+        return
+
+    user_input = message.text.strip()
+    user = db.get_username(user_input)
+
+    if not user:
+        await message.answer("❌ Пользователь не найден", reply_markup=admin_back_keyboard())
+        await state.clear()
+        return
+
+    target_id = user[0]
+    profile_text = build_profile_text(target_id, user)
+    
+    username_info = f"@{user[1]}" if user[1] else "Отсутствует"
+    name_info = user[2] or "Не указано"
+    
+    full_info = (
+        f"📊 <b>Информация о пользователе:</b>\n"
+        f"👤 Имя: {html.escape(name_info)}\n"
+        f"🏷 Юзернейм: {username_info}\n\n"
+        f"{profile_text}"
+    )
+
+    await state.clear()
+    await message.answer(full_info, reply_markup=admin_back_keyboard())
 
 @dp.callback_query(F.data == "admin_disable")
 async def admin_disable_start(callback: CallbackQuery, state: FSMContext):
