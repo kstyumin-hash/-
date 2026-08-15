@@ -114,6 +114,11 @@ class PGConnection:
             keepalives_count=5
         )
         conn.autocommit = True
+        
+        # Устанавливаем schema public для каждого нового подключения
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO public;")
+            
         return conn
 
     def execute(self, query, params=()):
