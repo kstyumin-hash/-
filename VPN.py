@@ -1,17 +1,17 @@
 # ==========================================================
-# Stopka VPN - Полноценный VPN сервис
-# Telegram Bot + Web Server (для Render)
+# Stopka VPN — Полный рабочий код бота + интеграция с VLESS
+# Telegram Bot + Web Server (для Render) + Автогенерация ключей
 # ==========================================================
 
 import asyncio
 import logging
+import aiohttp
 import psycopg2
 import psycopg2.errorcodes
 import psycopg2.extensions as ext
 import json
 import os
 import html
-import io
 import time
 import traceback
 from collections import defaultdict
@@ -46,6 +46,11 @@ OWNER_ID = int(os.environ.get("OWNER_ID", 5604869107))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.getenv("PORT", 8080))
 
+# Настройки панели VPN (Marzban / Xray API)
+VPN_API_URL = os.environ.get("VPN_API_URL", "https://your-vpn-panel.com")
+VPN_ADMIN_USERNAME = os.environ.get("VPN_ADMIN_USERNAME", "admin")
+VPN_ADMIN_PASSWORD = os.environ.get("VPN_ADMIN_PASSWORD", "password")
+
 REFERRAL_DAYS = 7
 
 ############################################################
@@ -66,6 +71,80 @@ bot = Bot(
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+BOT_USERNAME = None  # кэшируется один раз при старте, чтобы не дёргать get_me() на каждый клик
+
+############################################################
+# VPN API CLIENT (Marzban / Xray)
+############################################################
+
+class VPNClient:
+    def __init__(self):
+        self.base_url = VPN_API_URL
+        self.token = None
+        self._session = None
+
+    def _get_session(self):
+        # Один переиспользуемый session вместо нового TCP/TLS-хендшейка на каждый запрос —
+        # ощутимо ускоряет обращения к панели (Marzban).
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def login(self):
+        session = self._get_session()
+        try:
+            async with session.post(
+                f"{self.base_url}/api/admin/token",
+                data={"username": VPN_ADMIN_USERNAME, "password": VPN_ADMIN_PASSWORD}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self.token = data.get("access_token")
+        except Exception as e:
+            logging.error(f"Ошибка авторизации в VPN панели: {e}")
+
+    async def create_or_update_user(self, user_id, expire_timestamp):
+        if not self.token:
+            await self.login()
+
+        headers = {"Authorization": f"Bearer {self.token}"}
+        username = f"user_{user_id}"
+        session = self._get_session()
+
+        async with session.get(f"{self.base_url}/api/user/{username}", headers=headers) as resp:
+            if resp.status == 200:
+                async with session.put(
+                    f"{self.base_url}/api/user/{username}",
+                    headers=headers,
+                    json={"expire": expire_timestamp}
+                ) as update_resp:
+                    if update_resp.status == 200:
+                        data = await update_resp.json()
+                        links = data.get("links", [])
+                        return links[0] if links else ""
+            elif resp.status == 404:
+                async with session.post(
+                    f"{self.base_url}/api/user",
+                    headers=headers,
+                    json={
+                        "username": username,
+                        "expire": expire_timestamp,
+                        "proxies": {"vless": {"flow": ""}},
+                        "inbounds": {"vless": ["VLESS Reality"]}
+                    }
+                ) as create_resp:
+                    if create_resp.status == 200:
+                        data = await create_resp.json()
+                        links = data.get("links", [])
+                        return links[0] if links else ""
+        return ""
+
+vpn_client = VPNClient()
+
 ############################################################
 # RATE LIMITER
 ############################################################
@@ -79,15 +158,9 @@ class RateLimiter:
     def is_allowed(self, user_id):
         now = time.time()
         window_start = now - self.window
-        
-        self.requests[user_id] = [
-            t for t in self.requests[user_id]
-            if t > window_start
-        ]
-        
+        self.requests[user_id] = [t for t in self.requests[user_id] if t > window_start]
         if len(self.requests[user_id]) >= self.max_requests:
             return False
-        
         self.requests[user_id].append(now)
         return True
 
@@ -114,11 +187,8 @@ class PGConnection:
             keepalives_count=5
         )
         conn.autocommit = True
-        
-        # Устанавливаем schema public для каждого нового подключения
         with conn.cursor() as cur:
             cur.execute("SET search_path TO public;")
-            
         return conn
 
     def execute(self, query, params=()):
@@ -128,48 +198,30 @@ class PGConnection:
                 self._conn = self._connect()
             elif self._conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
                 self._conn.rollback()
-            
             cur = self._conn.cursor()
             cur.execute(pg_query, params)
             return cur
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            logging.warning("⚠️ Потеряно соединение с PostgreSQL. Выполняется переподключение...")
-            try:
-                self._conn = self._connect()
-                cur = self._conn.cursor()
-                cur.execute(pg_query, params)
-                return cur
-            except Exception:
-                raise
         except Exception:
             try:
                 self._conn.rollback()
-            except Exception:
+            except:
                 pass
             raise
 
     def commit(self):
         try:
             self._conn.commit()
-        except Exception:
+        except:
             pass
 
 class Database:
     def __init__(self):
         if not DATABASE_URL:
-            raise RuntimeError(
-                "Не задана переменная окружения DATABASE_URL "
-                "(строка подключения к PostgreSQL)."
-            )
+            raise RuntimeError("Не задана переменная окружения DATABASE_URL.")
         self.conn = PGConnection(DATABASE_URL)
         self.create_tables()
 
     def create_tables(self):
-        try:
-            self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS balance INTEGER DEFAULT 0;")
-        except Exception as e:
-            logging.warning(f"Ошибка при выполнении миграции balance: {e}")
-
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id BIGINT PRIMARY KEY,
@@ -182,7 +234,8 @@ class Database:
             first_payment INTEGER DEFAULT 0,
             last_tariff TEXT,
             username_history TEXT DEFAULT '[]',
-            balance INTEGER DEFAULT 0
+            balance INTEGER DEFAULT 0,
+            vless_key TEXT DEFAULT ''
         )
         """)
         
@@ -195,6 +248,10 @@ class Database:
             status TEXT
         )
         """)
+        # Вложения к тикетам (фото/файл) — добавляем колонки, если их ещё нет
+        # (безопасно и для новой БД, и для уже существующей)
+        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_id TEXT DEFAULT ''")
+        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_type TEXT DEFAULT ''")
         
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes(
@@ -242,20 +299,19 @@ class Database:
         
         self.conn.commit()
 
-    # ===== User Methods =====
     def add_user(self, user_id, username, name):
         cursor = self.conn.execute("SELECT id FROM users WHERE id=?", (user_id,))
         if cursor.fetchone():
             return
         
-        expire = datetime.now() + timedelta(days=3)
-        expire_str = expire.strftime("%Y-%m-%d 23:59:59")
+        expire = datetime.now() + timedelta(days=0)
+        expire_str = expire.strftime("%Y-%m-%d %H:%M:%S")
         
         self.conn.execute("""
-            INSERT INTO users (id, username, name, expire_date, status, is_admin, invited_by, first_payment, last_tariff, username_history, balance) 
-            VALUES(?,?,?,?,?,0,0,0,'',?,0)
+            INSERT INTO users (id, username, name, expire_date, status, is_admin, invited_by, first_payment, last_tariff, username_history, balance, vless_key) 
+            VALUES(?,?,?,?,?,0,0,0,'',?,0,'')
             ON CONFLICT (id) DO NOTHING
-        """, (user_id, username or "", name or "", expire_str, "Активно", json.dumps([])))
+        """, (user_id, username or "", name or "", expire_str, "Отключено", json.dumps([])))
         self.conn.commit()
 
     def get_user(self, user_id):
@@ -404,7 +460,7 @@ TARIFFS = {
 def profile_keyboard(is_admin=False):
     buttons = [
         [InlineKeyboardButton(text="💳 Оплата VPN", callback_data="payment")],
-        [InlineKeyboardButton(text="📱 Подключить устройство", callback_data="connect_device")],
+        [InlineKeyboardButton(text="🔑 Мой ключ VLESS", callback_data="get_vless_key")],
         [InlineKeyboardButton(text="🎁 Пригласить друга", callback_data="my_ref")],
         [InlineKeyboardButton(text="🎟 Промокод", callback_data="promo")]
     ]
@@ -473,7 +529,11 @@ def admin_keyboard():
 def ticket_list_keyboard(tickets):
     buttons = []
     for ticket in tickets:
-        buttons.append([InlineKeyboardButton(text=f"🎟 #{ticket[0]} | {html.escape(ticket[2][:20])}", callback_data=f"ticket_{ticket[0]}")])
+        preview = ticket[2][:20] if ticket[2] else ""
+        if not preview:
+            file_type = ticket[6] if len(ticket) > 6 else ""
+            preview = "📷 Фото" if file_type == "photo" else ("📎 Файл" if file_type == "document" else "…")
+        buttons.append([InlineKeyboardButton(text=f"🎟 #{ticket[0]} | {html.escape(preview)}", callback_data=f"ticket_{ticket[0]}")])
     buttons.append([InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -481,7 +541,14 @@ def promo_admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать промокод", callback_data="promo_create")],
         [InlineKeyboardButton(text="📋 Список промокодов", callback_data="promo_list")],
+        [InlineKeyboardButton(text="🗑 Очистить использованные", callback_data="promo_clear_confirm")],
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")]
+    ])
+
+def promo_clear_confirm_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, очистить", callback_data="promo_clear_yes")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_admin")]
     ])
 
 ############################################################
@@ -499,52 +566,46 @@ async def rate_limit_middleware(handler, message: Message, data: dict):
 # HELPER FUNCTIONS
 ############################################################
 
-def build_profile_text(user_id, user_data):
+def calculate_days(expire_str):
     try:
-        expire = datetime.strptime(user_data[3], "%Y-%m-%d %H:%M:%S")
+        expire = datetime.strptime(expire_str, "%Y-%m-%d %H:%M:%S")
     except:
         try:
-            expire = datetime.strptime(user_data[3], "%Y-%m-%d")
+            expire = datetime.strptime(expire_str, "%Y-%m-%d")
         except:
-            expire = datetime.now()
-    
+            return 0
     now = datetime.now()
     if expire > now:
         delta = expire - now
-        days = max(1, int(round(delta.total_seconds() / 86400)))
-    else:
-        days = 0
+        return max(0, int(round(delta.total_seconds() / 86400)))
+    return 0
 
+def build_profile_text(user_id, user_data):
+    days = calculate_days(user_data[3])
     vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
-    balance = days * 5
 
     text = (
         f"Stopka VPN🛡️\n\n"
         f"😎 Мой профиль\n"
-        f"┌ 🆔 ID:  {user_id}\n"
+        f"┌ 🆔 ID: <code>{user_id}</code>\n"
         f"├ ⭐ Подписка: Premium\n"
-        f"├ 💳 Баланс: {balance} ₽ хватит на ≈{days} дней\n"
+        f"├ ⏳ Осталось дней: <b>{days}</b>\n"
         f"└ 🔑 VPN: {vpn_status}"
     )
     return text
 
-async def render_profile(user_id, target_message=None, callback=None):
-    user = db.get_user(user_id)
+async def render_profile(user_id, target_message=None, callback=None, user=None):
+    if user is None:
+        user = await asyncio.to_thread(db.get_user, user_id)
     if not user:
         if target_message:
-            db.add_user(user_id, target_message.from_user.username or "", target_message.from_user.full_name)
-            user = db.get_user(user_id)
-        
-        if not user:
-            if callback:
-                await callback.answer("Ошибка пользователя", show_alert=True)
-            elif target_message:
-                await target_message.answer("❌ Ошибка загрузки профиля. Попробуйте еще раз /start")
-            return
+            await asyncio.to_thread(db.add_user, user_id, target_message.from_user.username or "", target_message.from_user.full_name)
+            user = await asyncio.to_thread(db.get_user, user_id)
 
     text = build_profile_text(user_id, user)
-    is_admin = db.is_admin(user_id)
-    kb = profile_keyboard(is_admin)
+    # is_admin известен из уже полученной строки пользователя — не дёргаем БД повторно
+    is_admin_flag = (user_id == OWNER_ID) or (user is not None and user[5] == 1)
+    kb = profile_keyboard(is_admin_flag)
 
     if callback:
         await callback.message.edit_text(text, reply_markup=kb)
@@ -560,21 +621,19 @@ async def render_profile(user_id, target_message=None, callback=None):
 async def start(message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or ""
-    
-    logging.info(f"➡️ /start от user_id={user_id} username={username}")
 
-    user = db.get_user(user_id)
-    if user and (user[1] or "") != username:
-        db.update_username(user_id, username)
-    
-    db.add_user(
-        user_id,
-        username,
-        message.from_user.full_name
-    )
-    
+    user = await asyncio.to_thread(db.get_user, user_id)
+    if user:
+        if (user[1] or "") != username:
+            await asyncio.to_thread(db.update_username, user_id, username)
+    else:
+        # Новый пользователь — add_user сам делает SELECT+INSERT,
+        # для уже существующих users эта проверка теперь не дублируется
+        await asyncio.to_thread(db.add_user, user_id, username, message.from_user.full_name)
+        user = await asyncio.to_thread(db.get_user, user_id)
+
     if user_id == OWNER_ID:
-        db.set_admin(user_id, True)
+        await asyncio.to_thread(db.set_admin, user_id, True)
     
     args = message.text.split()
     if len(args) > 1:
@@ -583,23 +642,24 @@ async def start(message: Message):
             try:
                 inviter = int(ref.replace("STOPKA", ""))
                 if inviter != user_id:
-                    cursor = db.conn.execute("SELECT invited_by FROM users WHERE id=?", (user_id,))
+                    cursor = await asyncio.to_thread(db.conn.execute, "SELECT invited_by FROM users WHERE id=?", (user_id,))
                     existing = cursor.fetchone()
                     if existing and existing[0] == 0:
-                        db.conn.execute("UPDATE users SET invited_by=? WHERE id=?", (inviter, user_id))
-                        db.conn.execute("INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0) ON CONFLICT (user_id) DO NOTHING", (user_id, inviter))
-                        db.conn.commit()
+                        await asyncio.to_thread(db.conn.execute, "UPDATE users SET invited_by=? WHERE id=?", (inviter, user_id))
+                        await asyncio.to_thread(db.conn.execute, "INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0) ON CONFLICT (user_id) DO NOTHING", (user_id, inviter))
+                        await asyncio.to_thread(db.conn.commit)
             except Exception as e:
                 logging.error(f"Ошибка обработки реферала: {e}")
     
-    await render_profile(user_id, target_message=message)
+    await render_profile(user_id, target_message=message, user=user)
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
     await message.answer(
         "🛡 <b>Поддержка Stopka VPN</b>\n\n"
-        "Если у вас возникли вопросы или проблемы с работой сервиса, вы можете обратиться в техподдержку.\n\n"
-        "Нажмите кнопку ниже, чтобы отправить сообщение администраторам:",
+        "Не переживайте — если что-то пошло не так, мы обязательно разберёмся и поможем 🤝\n\n"
+        "Опишите свой вопрос или проблему, а также приложите фото или файл (например, скриншот ошибки или чек об оплате) — так мы сможем помочь быстрее.\n\n"
+        "Нажмите кнопку ниже, чтобы написать администраторам:",
         reply_markup=support_keyboard()
     )
 
@@ -608,7 +668,7 @@ async def about_command(message: Message):
     await message.answer("👨‍💻 Создатели: @prostokiril, @ll1_what")
 
 ############################################################
-# PROFILE & ACTIONS
+# PROFILE & VLESS KEY LOGIC
 ############################################################
 
 @dp.callback_query(F.data == "profile")
@@ -616,9 +676,37 @@ async def profile_callback(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await render_profile(callback.from_user.id, callback=callback)
 
-@dp.callback_query(F.data == "connect_device")
-async def connect_device(callback: CallbackQuery):
-    await callback.answer("🛠 Функция в разработке", show_alert=True)
+@dp.callback_query(F.data == "get_vless_key")
+async def get_vless_key(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = await asyncio.to_thread(db.get_user, user_id)
+    days = calculate_days(user[3])
+
+    if days <= 0:
+        await callback.answer("❌ Подписка неактивна. Оплатите дни, чтобы получить ключ для Happ.", show_alert=True)
+        return
+
+    vless_key = user[11]
+    if not vless_key:
+        try:
+            expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+            timestamp = int(expire_dt.timestamp())
+            vless_key = await vpn_client.create_or_update_user(user_id, timestamp)
+            await asyncio.to_thread(db.conn.execute, "UPDATE users SET vless_key=? WHERE id=?", (vless_key, user_id))
+            await asyncio.to_thread(db.conn.commit)
+        except Exception as e:
+            logging.error(f"Ошибка генерации ключа через API: {e}")
+
+    if not vless_key:
+        vless_key = f"vless://error-check-api-connection@panel:443?encryption=none&security=reality#StopkaVPN"
+
+    await callback.message.edit_text(
+        f"🔑 <b>Ваш ключ VLESS для Happ:</b>\n\n"
+        f"Скопируйте эту строку и добавьте в приложение Happ:\n\n"
+        f"<code>{vless_key}</code>",
+        reply_markup=back_keyboard()
+    )
+    await callback.answer()
 
 ############################################################
 # PAYMENTS
@@ -662,8 +750,8 @@ async def process_pay(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"💳 <b>Оплата тарифного плана</b>\n\n"
-        f"Для оплаты откройте тикет у нашего менеджера в @StopkaPayments_bot.\n\n"
-        f"📌 <b>Откройте тикет и напишите ему это сообщение:</b>\n"
+        f"Для оплаты напишите менеджеру в @StopkaPayments_bot.\n\n"
+        f"📌 <b>Напишите ему это сообщение:</b>\n"
         f"<code>{msg_to_copy}</code>",
         reply_markup=manager_pay_keyboard()
     )
@@ -705,15 +793,12 @@ async def process_successful_payment(message: Message):
         tariff = TARIFFS.get(tariff_id)
         if tariff:
             days = tariff["days"]
-            user = db.get_user(user_id)
+            user = await asyncio.to_thread(db.get_user, user_id)
             if user:
                 try:
                     expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
                 except:
-                    try:
-                        expire = datetime.strptime(user[3], "%Y-%m-%d")
-                    except:
-                        expire = datetime.now()
+                    expire = datetime.now()
                 
                 now = datetime.now()
                 if expire < now:
@@ -722,8 +807,13 @@ async def process_successful_payment(message: Message):
                 new_expire = expire + timedelta(days=days)
                 new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
                 
-                db.conn.execute("UPDATE users SET expire_date=?, status='Активно', last_tariff=? WHERE id=?", (new_expire_str, tariff['name'], user_id))
-                db.conn.commit()
+                await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно', last_tariff=? WHERE id=?", (new_expire_str, tariff['name'], user_id))
+                await asyncio.to_thread(db.conn.commit)
+
+                try:
+                    await vpn_client.create_or_update_user(user_id, int(new_expire.timestamp()))
+                except:
+                    pass
                 
                 await message.answer(
                     f"🎉 <b>Оплата прошла успешно!</b>\n\n"
@@ -738,9 +828,12 @@ async def process_successful_payment(message: Message):
 
 @dp.callback_query(F.data == "my_ref")
 async def my_ref(callback: CallbackQuery):
-    bot_info = await bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=STOPKA{callback.from_user.id}"
-    ref_count = db.get_referral_count(callback.from_user.id)
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        bot_info = await bot.get_me()
+        BOT_USERNAME = bot_info.username
+    link = f"https://t.me/{BOT_USERNAME}?start=STOPKA{callback.from_user.id}"
+    ref_count = await asyncio.to_thread(db.get_referral_count, callback.from_user.id)
     await callback.message.edit_text(
         f"🎁 <b>Реферальная программа</b>\n\n"
         f"Приглашай друзей и получай бонусные дни VPN.\n\n"
@@ -766,12 +859,12 @@ async def promo_use(message: Message, state: FSMContext):
     code = message.text.upper().strip()
     user_id = message.from_user.id
 
-    if db.is_promo_used(user_id, code):
+    if await asyncio.to_thread(db.is_promo_used, user_id, code):
         await message.answer("❌ Вы уже активировали этот промокод!")
         await state.clear()
         return
 
-    promo = db.conn.execute("SELECT * FROM promo_codes WHERE code=?", (code,)).fetchone()
+    promo = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM promo_codes WHERE code=?", (code,))).fetchone()
     if not promo:
         await message.answer("❌ Промокод не найден")
         await state.clear()
@@ -782,7 +875,7 @@ async def promo_use(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    user = db.get_user(user_id)
+    user = await asyncio.to_thread(db.get_user, user_id)
     if not user:
         await message.answer("❌ Ошибка пользователя")
         await state.clear()
@@ -791,7 +884,7 @@ async def promo_use(message: Message, state: FSMContext):
     try:
         expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
     except:
-        expire = datetime.strptime(user[3], "%Y-%m-%d")
+        expire = datetime.now()
 
     now = datetime.now()
     if expire < now:
@@ -801,10 +894,15 @@ async def promo_use(message: Message, state: FSMContext):
     new_expire = expire + timedelta(days=days)
     new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
 
-    db.conn.execute("UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (new_expire_str, user_id))
-    db.conn.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=?", (code,))
-    db.mark_promo_used(user_id, code)
-    db.conn.commit()
+    await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (new_expire_str, user_id))
+    await asyncio.to_thread(db.conn.execute, "UPDATE promo_codes SET uses=uses+1 WHERE code=?", (code,))
+    await asyncio.to_thread(db.mark_promo_used, user_id, code)
+    await asyncio.to_thread(db.conn.commit)
+
+    try:
+        await vpn_client.create_or_update_user(user_id, int(new_expire.timestamp()))
+    except:
+        pass
 
     await state.clear()
     await message.answer(f"✅ Промокод активирован! Добавлено +{days} дней.")
@@ -817,21 +915,35 @@ async def promo_use(message: Message, state: FSMContext):
 async def create_ticket(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TicketState.waiting_text)
     await callback.message.edit_text(
-        "📝 Опишите вашу проблему или напишите по поводу оплаты в одном сообщении:",
+        "📝 Опишите вашу проблему или напишите по поводу оплаты в одном сообщении.\n\n"
+        "Можно приложить фото или файл (например, скриншот или чек):",
         reply_markup=back_keyboard()
     )
     await callback.answer()
 
-@dp.message(TicketState.waiting_text)
+@dp.message(TicketState.waiting_text, F.text | F.photo | F.document)
 async def process_ticket(message: Message, state: FSMContext):
-    text = message.text.strip()
-    db.conn.execute(
-        "INSERT INTO tickets (user_id, message, answer, status) VALUES(?,?,?,?)",
-        (message.from_user.id, text, "", "Открыт")
+    text = (message.text or message.caption or "").strip()
+    file_id = ""
+    file_type = ""
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        file_type = "photo"
+    elif message.document:
+        file_id = message.document.file_id
+        file_type = "document"
+
+    if not text and not file_id:
+        await message.answer("❌ Пришлите текст, фото или файл с описанием проблемы.")
+        return
+
+    await asyncio.to_thread(db.conn.execute, 
+        "INSERT INTO tickets (user_id, message, answer, status, file_id, file_type) VALUES(?,?,?,?,?,?)",
+        (message.from_user.id, text, "", "Открыт", file_id, file_type)
     )
-    db.conn.commit()
+    await asyncio.to_thread(db.conn.commit)
     await state.clear()
-    await message.answer("✅ Ваше обращение отправлено поддержки!", reply_markup=back_keyboard())
+    await message.answer("✅ Ваше обращение отправлено в поддержку!", reply_markup=back_keyboard())
 
 ############################################################
 # ADMIN PANEL
@@ -840,7 +952,7 @@ async def process_ticket(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "admin")
 async def admin_panel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         await callback.answer("❌ Нет доступа. Вы не администратор!", show_alert=True)
         return
 
@@ -852,7 +964,7 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_view_profile")
 async def admin_view_profile_start(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     await state.set_state(AdminProfileState.waiting_username)
@@ -865,11 +977,11 @@ async def admin_view_profile_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminProfileState.waiting_username)
 async def admin_view_profile_finish(message: Message, state: FSMContext):
-    if not db.is_admin(message.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, message.from_user.id):
         return
 
     user_input = message.text.strip()
-    user = db.get_username(user_input)
+    user = await asyncio.to_thread(db.get_username, user_input)
 
     if not user:
         await message.answer("❌ Пользователь не найден", reply_markup=admin_back_keyboard())
@@ -894,7 +1006,7 @@ async def admin_view_profile_finish(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_disable")
 async def admin_disable_start(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     await state.set_state(AdminDisableState.waiting_username)
@@ -907,19 +1019,19 @@ async def admin_disable_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminDisableState.waiting_username)
 async def admin_disable_finish(message: Message, state: FSMContext):
-    if not db.is_admin(message.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, message.from_user.id):
         return
 
     user_input = message.text.strip()
-    user = db.get_username(user_input)
+    user = await asyncio.to_thread(db.get_username, user_input)
 
     if not user:
         await message.answer("❌ Пользователь не найден", reply_markup=admin_back_keyboard())
         await state.clear()
         return
 
-    db.disable_subscription(user[0])
-    db.add_admin_log(message.from_user.id, "Отключил подписку", user[0])
+    await asyncio.to_thread(db.disable_subscription, user[0])
+    await asyncio.to_thread(db.add_admin_log, message.from_user.id, "Отключил подписку", user[0])
 
     try:
         await bot.send_message(user[0], "❌ Ваша подписка Stopka VPN была отключена администратором.")
@@ -931,10 +1043,10 @@ async def admin_disable_finish(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "users_count")
 async def users_count(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
-    total = db.get_total_users_count()
+    total = await asyncio.to_thread(db.get_total_users_count)
     await callback.message.edit_text(
         f"👥 <b>Статистика пользователей</b>\n\n"
         f"Всего пользователей: <b>{total}</b>",
@@ -944,7 +1056,7 @@ async def users_count(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_toggle")
 async def admin_toggle_start(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
     await state.set_state(AdminToggleState.waiting_username)
@@ -958,11 +1070,11 @@ async def admin_toggle_start(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminToggleState.waiting_username)
 async def admin_toggle_finish(message: Message, state: FSMContext):
-    if not db.is_admin(message.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, message.from_user.id):
         return
 
     user_input = message.text.strip()
-    user = db.get_username(user_input)
+    user = await asyncio.to_thread(db.get_username, user_input)
 
     if not user:
         await message.answer("❌ Пользователь не найден", reply_markup=admin_back_keyboard())
@@ -977,17 +1089,17 @@ async def admin_toggle_finish(message: Message, state: FSMContext):
 
     current_status = user[5] == 1
     new_status = not current_status
-    db.set_admin(target_id, new_status)
+    await asyncio.to_thread(db.set_admin, target_id, new_status)
     
     status_str = "теперь администратор" if new_status else "больше не администратор"
-    db.add_admin_log(message.from_user.id, f"Изменил статус админа на {new_status}", target_id)
+    await asyncio.to_thread(db.add_admin_log, message.from_user.id, f"Изменил статус админа на {new_status}", target_id)
     
     await state.clear()
     await message.answer(f"✅ Пользователь {user[1] or target_id} {status_str}!", reply_markup=admin_back_keyboard())
 
 @dp.callback_query(F.data == "admin_give")
 async def admin_give(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
     await state.set_state(AdminGiveState.waiting_data)
@@ -1000,7 +1112,7 @@ async def admin_give(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AdminGiveState.waiting_data)
 async def give_days(message: Message, state: FSMContext):
-    if not db.is_admin(message.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, message.from_user.id):
         return
     try:
         username, days_str = message.text.split()
@@ -1009,7 +1121,7 @@ async def give_days(message: Message, state: FSMContext):
         await message.answer("❌ Неверный формат. Пример: `@user 30`", reply_markup=admin_back_keyboard())
         return
 
-    user = db.get_username(username)
+    user = await asyncio.to_thread(db.get_username, username)
     if not user:
         await message.answer("❌ Пользователь не найден", reply_markup=admin_back_keyboard())
         await state.clear()
@@ -1018,7 +1130,7 @@ async def give_days(message: Message, state: FSMContext):
     try:
         expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
     except:
-        expire = datetime.strptime(user[3], "%Y-%m-%d")
+        expire = datetime.now()
 
     now = datetime.now()
     if expire < now:
@@ -1027,20 +1139,24 @@ async def give_days(message: Message, state: FSMContext):
     expire += timedelta(days=days)
     expire_str = expire.strftime("%Y-%m-%d 23:59:59")
 
-    db.conn.execute("UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (expire_str, user[0]))
-    db.conn.commit()
-    db.add_admin_log(message.from_user.id, f"Выдал {days} дней", user[0])
+    await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (expire_str, user[0]))
+    await asyncio.to_thread(db.conn.commit)
+    await asyncio.to_thread(db.add_admin_log, message.from_user.id, f"Выдал {days} дней", user[0])
+
+    try:
+        await vpn_client.create_or_update_user(user[0], int(expire.timestamp()))
+    except:
+        pass
 
     await state.clear()
     await message.answer(f"✅ Выдано {days} дней пользователю {username}", reply_markup=admin_back_keyboard())
 
-# --- TICKETS ADMIN ---
 @dp.callback_query(F.data == "admin_tickets")
 async def admin_tickets(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         await callback.answer("❌ Нет прав", show_alert=True)
         return
-    cursor = db.conn.execute("SELECT * FROM tickets WHERE status='Открыт'")
+    cursor = await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE status='Открыт'")
     tickets = cursor.fetchall()
     if not tickets:
         await callback.message.edit_text("🎟 Открытых тикетов нет", reply_markup=admin_back_keyboard())
@@ -1049,10 +1165,10 @@ async def admin_tickets(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("ticket_"))
 async def open_ticket(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
     ticket_id = int(callback.data.split("_")[1])
-    ticket = db.conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+    ticket = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
     if not ticket:
         await callback.answer("Тикет не найден", show_alert=True)
         return
@@ -1061,14 +1177,22 @@ async def open_ticket(callback: CallbackQuery):
         [InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close_{ticket_id}")],
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")]
     ])
-    await callback.message.edit_text(
-        f"🎟 <b>Тикет #{ticket[0]}</b>\nПользователь ID: {ticket[1]}\n\nСообщение:\n{ticket[2]}",
-        reply_markup=keyboard
-    )
+    caption = f"🎟 <b>Тикет #{ticket[0]}</b>\nПользователь ID: {ticket[1]}\n\nСообщение:\n{ticket[2] or '—'}"
+    file_id = ticket[5] if len(ticket) > 5 else ""
+    file_type = ticket[6] if len(ticket) > 6 else ""
+
+    if file_type == "photo" and file_id:
+        await callback.message.delete()
+        await callback.message.answer_photo(photo=file_id, caption=caption, reply_markup=keyboard)
+    elif file_type == "document" and file_id:
+        await callback.message.delete()
+        await callback.message.answer_document(document=file_id, caption=caption, reply_markup=keyboard)
+    else:
+        await callback.message.edit_text(caption, reply_markup=keyboard)
 
 @dp.callback_query(F.data.startswith("reply_"))
 async def reply_ticket(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
     ticket_id = int(callback.data.split("_")[1])
     await state.update_data(ticket_id=ticket_id)
@@ -1077,43 +1201,42 @@ async def reply_ticket(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(ReplyState.waiting_answer)
 async def send_ticket_answer(message: Message, state: FSMContext):
-    if not db.is_admin(message.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, message.from_user.id):
         return
     data = await state.get_data()
     ticket_id = data["ticket_id"]
-    ticket = db.conn.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+    ticket = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
     if ticket:
         try:
             await bot.send_message(ticket[1], f"📩 <b>Ответ поддержки:</b>\n\n{message.text}")
         except:
             pass
-        db.conn.execute("UPDATE tickets SET answer=?, status='Закрыт' WHERE id=?", (message.text, ticket_id))
-        db.conn.commit()
+        await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET answer=?, status='Закрыт' WHERE id=?", (message.text, ticket_id))
+        await asyncio.to_thread(db.conn.commit)
     await state.clear()
     await message.answer("✅ Ответ отправлен!", reply_markup=admin_back_keyboard())
 
 @dp.callback_query(F.data.startswith("close_"))
 async def close_ticket(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
     ticket_id = int(callback.data.split("_")[1])
-    db.conn.execute("UPDATE tickets SET status='Закрыт' WHERE id=?", (ticket_id,))
-    db.conn.commit()
+    await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET status='Закрыт' WHERE id=?", (ticket_id,))
+    await asyncio.to_thread(db.conn.commit)
     await callback.answer("✅ Тикет закрыт")
     await admin_tickets(callback)
 
-# --- PROMO ADMIN ---
 @dp.callback_query(F.data == "promo_admin")
 async def promo_admin(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
     await callback.message.edit_text("🎁 <b>Управление промокодами</b>", reply_markup=promo_admin_keyboard())
 
 @dp.callback_query(F.data == "promo_list")
 async def promo_list(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
-    promos = db.conn.execute("SELECT code, days, uses, max_uses FROM promo_codes").fetchall()
+    promos = (await asyncio.to_thread(db.conn.execute, "SELECT code, days, uses, max_uses FROM promo_codes")).fetchall()
     if not promos:
         await callback.message.edit_text("📋 Промокодов нет", reply_markup=promo_admin_keyboard())
         return
@@ -1122,9 +1245,39 @@ async def promo_list(callback: CallbackQuery):
         text += f"🎟 {p[0]}: +{p[1]} дней ({p[2]}/{p[3]})\n"
     await callback.message.edit_text(text, reply_markup=promo_admin_keyboard())
 
+@dp.callback_query(F.data == "promo_clear_confirm")
+async def promo_clear_confirm(callback: CallbackQuery):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
+        return
+    await callback.message.edit_text(
+        "🗑 <b>Очистка промокодов</b>\n\n"
+        "Будут удалены все промокоды, которые уже <b>полностью использованы</b> "
+        "(использований = максимум).\n"
+        "Промокоды, у которых остались свободные активации, не тронутся.\n\n"
+        "Продолжить?",
+        reply_markup=promo_clear_confirm_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "promo_clear_yes")
+async def promo_clear_yes(callback: CallbackQuery):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
+        return
+    cursor = await asyncio.to_thread(
+        db.conn.execute,
+        "DELETE FROM promo_codes WHERE uses >= max_uses"
+    )
+    deleted = cursor.rowcount
+    await asyncio.to_thread(db.conn.commit)
+    await callback.message.edit_text(
+        f"✅ Удалено полностью использованных промокодов: <b>{deleted}</b>",
+        reply_markup=promo_admin_keyboard()
+    )
+    await callback.answer()
+
 @dp.callback_query(F.data == "promo_create")
 async def promo_create_start(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
     await state.set_state(PromoCreateState.waiting_code)
     await callback.message.edit_text("Введите название промокода (например `SUMMER2026`):", reply_markup=admin_back_keyboard())
@@ -1150,33 +1303,36 @@ async def promo_create_finish(message: Message, state: FSMContext):
     try:
         max_uses = int(message.text)
         data = await state.get_data()
-        db.conn.execute(
+        await asyncio.to_thread(db.conn.execute, 
             "INSERT INTO promo_codes (code, days, uses, max_uses) VALUES(?,?,0,?) ON CONFLICT DO NOTHING",
             (data['code'], data['days'], max_uses)
         )
-        db.conn.commit()
+        await asyncio.to_thread(db.conn.commit)
         await state.clear()
         await message.answer(f"✅ Промокод `{data['code']}` создан!", reply_markup=admin_back_keyboard())
     except Exception as e:
         await message.answer(f"Ошибка: {e}", reply_markup=admin_back_keyboard())
 
-# --- BROADCAST ---
 @dp.callback_query(F.data == "broadcast")
 async def broadcast_start(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
     await state.set_state(BroadcastState.waiting_text)
-    await callback.message.edit_text("📢 Введите текст рассылки:", reply_markup=admin_back_keyboard())
+    await callback.message.edit_text(
+        "📢 Отправьте сообщение для рассылки (текст, фото или файл с подписью):",
+        reply_markup=admin_back_keyboard()
+    )
 
 @dp.message(BroadcastState.waiting_text)
 async def broadcast_finish(message: Message, state: FSMContext):
-    if not db.is_admin(message.from_user.id):
+    if not await asyncio.to_thread(db.is_admin, message.from_user.id):
         return
-    users = db.conn.execute("SELECT id FROM users").fetchall()
+    users = (await asyncio.to_thread(db.conn.execute, "SELECT id FROM users")).fetchall()
     count = 0
     for u in users:
         try:
-            await bot.send_message(u[0], message.text)
+            # copy_to пересылает любой тип сообщения (текст, фото, файл) как есть
+            await message.copy_to(chat_id=u[0])
             count += 1
             await asyncio.sleep(0.05)
         except:
@@ -1185,27 +1341,39 @@ async def broadcast_finish(message: Message, state: FSMContext):
     await message.answer(f"✅ Рассылка завершена! Доставлено {count} пользователям.", reply_markup=admin_back_keyboard())
 
 ############################################################
-# NOTIFICATIONS TASK
+# SUBSCRIPTION & EXPIRATION CHECKER TASK
 ############################################################
 
-async def subscription_notifications():
+async def subscription_checker():
     while True:
         try:
-            users = db.conn.execute("SELECT id, expire_date FROM users").fetchall()
+            users = (await asyncio.to_thread(db.conn.execute, "SELECT id, expire_date, status FROM users")).fetchall()
             for u in users:
+                user_id, expire_str, status = u[0], u[1], u[2]
                 try:
-                    expire = datetime.strptime(u[1], "%Y-%m-%d %H:%M:%S")
+                    expire = datetime.strptime(expire_str, "%Y-%m-%d %H:%M:%S")
                 except:
                     continue
-                days = (expire - datetime.now()).days
-                if days == 3 and not db.notification_sent(u[0], "3days"):
+                
+                now = datetime.now()
+                # Если время вышло, а статус всё ещё Активно — отключаем
+                if expire < now and status == "Активно":
+                    await asyncio.to_thread(db.disable_subscription, user_id)
                     try:
-                        await bot.send_message(u[0], "⏰ Ваша подписка Stopka VPN закончится через 3 дня!")
-                        db.save_notification(u[0], "3days")
+                        await bot.send_message(user_id, "❌ Ваша подписка на VPN истекла. Ключ отключен, продлите подписку для возобновления доступа.")
+                    except:
+                        pass
+                
+                # Уведомление за 3 дня
+                days = (expire - now).days
+                if days == 3 and status == "Активно" and not await asyncio.to_thread(db.notification_sent, user_id, "3days"):
+                    try:
+                        await bot.send_message(user_id, "⏰ Ваша подписка Stopka VPN закончится через 3 дня!")
+                        await asyncio.to_thread(db.save_notification, user_id, "3days")
                     except:
                         pass
         except Exception as e:
-            logging.error(f"Ошибка уведомлений: {e}")
+            logging.error(f"Ошибка проверки подписок: {e}")
         await asyncio.sleep(3600)
 
 async def set_commands():
@@ -1252,20 +1420,26 @@ async def start_web_server():
 ############################################################
 
 async def main():
+    global BOT_USERNAME
     logging.info("🚀 Запуск Stopka VPN...")
-    await set_commands()
 
-    # Запуск HTTP сервера для Render Health Check
-    await start_web_server()
+    bot_info = await bot.get_me()
+    BOT_USERNAME = bot_info.username
 
-    # Фоновые задачи
-    asyncio.create_task(subscription_notifications())
+    # Независимые задачи запуска — параллельно, а не одна за другой
+    await asyncio.gather(
+        set_commands(),
+        start_web_server(),
+        bot.delete_webhook(drop_pending_updates=True)
+    )
 
-    # Сброс вебхука и удаление зависших обновлений
-    await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(subscription_checker())
 
     logging.info("✅ Stopka VPN запущен успешно!")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await vpn_client.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
