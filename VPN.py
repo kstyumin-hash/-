@@ -13,6 +13,7 @@ import json
 import os
 import html
 import time
+import threading
 import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -198,6 +199,12 @@ IntegrityError = psycopg2.errors.lookup(psycopg2.errorcodes.UNIQUE_VIOLATION)
 class PGConnection:
     def __init__(self, dsn):
         self._dsn = dsn
+        # Все .execute() уходят в отдельные потоки через asyncio.to_thread,
+        # а соединение psycopg2 — одно общее на весь бот. Без лока два запроса,
+        # выполненные почти одновременно двумя пользователями, могли бы попасть
+        # в одно соединение параллельно из разных потоков — это не поддерживается
+        # psycopg2/libpq и могло приводить к редким сбоям под нагрузкой.
+        self._lock = threading.Lock()
         self._conn = self._connect()
 
     def _connect(self):
@@ -216,26 +223,28 @@ class PGConnection:
 
     def execute(self, query, params=()):
         pg_query = query.replace("?", "%s")
-        try:
-            if self._conn.closed:
-                self._conn = self._connect()
-            elif self._conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
-                self._conn.rollback()
-            cur = self._conn.cursor()
-            cur.execute(pg_query, params)
-            return cur
-        except Exception:
+        with self._lock:
             try:
-                self._conn.rollback()
-            except:
-                pass
-            raise
+                if self._conn.closed:
+                    self._conn = self._connect()
+                elif self._conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
+                    self._conn.rollback()
+                cur = self._conn.cursor()
+                cur.execute(pg_query, params)
+                return cur
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except:
+                    pass
+                raise
 
     def commit(self):
-        try:
-            self._conn.commit()
-        except:
-            pass
+        with self._lock:
+            try:
+                self._conn.commit()
+            except:
+                pass
 
 class Database:
     def __init__(self):
@@ -498,6 +507,23 @@ TARIFFS = {
 
 TRIAL_DAYS = 3
 RUB_PER_DAY = 5  # курс пересчёта баланса в дни: 5₽ = 1 день
+
+############################################################
+# ЛЁГКИЙ АНТИСПАМ
+############################################################
+# Простой кулдаун по действиям (не строгий, чтобы не мешать обычным пользователям) —
+# защищает только от быстрого повторного долбления одной и той же кнопки/попыток.
+
+_last_action_time = {}
+
+def is_rate_limited(user_id: int, action: str, cooldown: float) -> bool:
+    key = (user_id, action)
+    now = time.monotonic()
+    last = _last_action_time.get(key, 0)
+    if now - last < cooldown:
+        return True
+    _last_action_time[key] = now
+    return False
 
 TERMS_TEXT = """<b>УСЛОВИЯ ИСПОЛЬЗОВАНИЯ</b>
 
@@ -995,7 +1021,47 @@ async def process_successful_payment(message: Message):
                     await vpn_client.create_or_update_user(user_id, int(new_expire.timestamp()))
                 except:
                     pass
-                
+
+                # Реферальный бонус — начисляется один раз, в момент ПЕРВОЙ реальной
+                # оплаты приглашённого (а не за сам факт перехода по ссылке — так
+                # бонус не накрутить фейковыми регистрациями без покупки).
+                if not user[7]:  # first_payment ещё не было
+                    await asyncio.to_thread(db.conn.execute, "UPDATE users SET first_payment=1 WHERE id=?", (user_id,))
+                    await asyncio.to_thread(db.conn.commit)
+
+                    inviter_id = user[6]  # invited_by
+                    if inviter_id:
+                        row = (await asyncio.to_thread(
+                            db.conn.execute, "SELECT bonus_given FROM referrals WHERE user_id=?", (user_id,)
+                        )).fetchone()
+                        if row and row[0] == 0:
+                            inviter = await asyncio.to_thread(db.get_user, inviter_id)
+                            if inviter:
+                                try:
+                                    inv_expire = datetime.strptime(inviter[3], "%Y-%m-%d %H:%M:%S")
+                                except:
+                                    inv_expire = datetime.now()
+                                if inv_expire < datetime.now():
+                                    inv_expire = datetime.now()
+                                inv_new_expire = inv_expire + timedelta(days=REFERRAL_DAYS)
+                                inv_new_expire_str = inv_new_expire.strftime("%Y-%m-%d 23:59:59")
+
+                                await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (inv_new_expire_str, inviter_id))
+                                await asyncio.to_thread(db.conn.execute, "UPDATE referrals SET bonus_given=1 WHERE user_id=?", (user_id,))
+                                await asyncio.to_thread(db.conn.commit)
+
+                                try:
+                                    await vpn_client.create_or_update_user(inviter_id, int(inv_new_expire.timestamp()))
+                                except:
+                                    pass
+                                try:
+                                    await bot.send_message(
+                                        inviter_id,
+                                        f"🎁 Ваш друг оформил подписку по вашей ссылке!\nВам начислено +{REFERRAL_DAYS} дней VPN."
+                                    )
+                                except:
+                                    pass
+
                 await message.answer(
                     f"🎉 <b>Оплата прошла успешно!</b>\n\n"
                     f"Вам добавлено <b>+{days} дней</b> подписки.\n"
@@ -1039,6 +1105,10 @@ async def promo_start(callback: CallbackQuery, state: FSMContext):
 async def promo_use(message: Message, state: FSMContext):
     code = message.text.upper().strip()
     user_id = message.from_user.id
+
+    if is_rate_limited(user_id, "promo_attempt", cooldown=3):
+        await message.answer("⏳ Слишком часто — попробуйте через пару секунд.")
+        return
 
     if await asyncio.to_thread(db.is_promo_used, user_id, code):
         await message.answer("❌ Вы уже активировали этот промокод!")
@@ -1109,6 +1179,10 @@ async def create_ticket(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(TicketState.waiting_text, F.text | F.photo | F.document)
 async def process_ticket(message: Message, state: FSMContext):
+    if is_rate_limited(message.from_user.id, "create_ticket", cooldown=10):
+        await message.answer("⏳ Обращение уже отправляется — подождите немного перед следующим.")
+        return
+
     text = (message.text or message.caption or "").strip()
     file_id = ""
     file_type = ""
