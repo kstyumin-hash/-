@@ -9,11 +9,11 @@ import aiohttp
 import psycopg2
 import psycopg2.errorcodes
 import psycopg2.extensions as ext
+import psycopg2.pool as pg_pool
 import json
 import os
 import html
 import time
-import threading
 import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -196,55 +196,64 @@ rate_limiter = RateLimiter()
 
 IntegrityError = psycopg2.errors.lookup(psycopg2.errorcodes.UNIQUE_VIOLATION)
 
-class PGConnection:
-    def __init__(self, dsn):
-        self._dsn = dsn
-        # Все .execute() уходят в отдельные потоки через asyncio.to_thread,
-        # а соединение psycopg2 — одно общее на весь бот. Без лока два запроса,
-        # выполненные почти одновременно двумя пользователями, могли бы попасть
-        # в одно соединение параллельно из разных потоков — это не поддерживается
-        # psycopg2/libpq и могло приводить к редким сбоям под нагрузкой.
-        self._lock = threading.Lock()
-        self._conn = self._connect()
+class _PoolWithSetup(pg_pool.ThreadedConnectionPool):
+    """Пул соединений psycopg2: при создании КАЖДОГО нового физического
+    соединения применяет те же настройки, что раньше выставлялись один раз
+    для единственного общего соединения (autocommit, search_path)."""
+    def _connect(self, key=None):
+        conn = super()._connect(key)
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO public;")
+        return conn
 
-    def _connect(self):
-        conn = psycopg2.connect(
-            self._dsn,
+class PGConnection:
+    def __init__(self, dsn, minconn=1, maxconn=10):
+        self._dsn = dsn
+        # Раньше было одно соединение на весь бот (с локом на очередь запросов) —
+        # это было БЕЗОПАСНО, но все запросы шли строго по очереди, один за другим.
+        # Пул даёт до `maxconn` реально параллельных соединений: несколько
+        # пользователей могут обращаться к БД одновременно без взаимного ожидания.
+        # ThreadedConnectionPool сам по себе потокобезопасен — свой лок не нужен.
+        self._pool = _PoolWithSetup(
+            minconn, maxconn, dsn,
             connect_timeout=10,
             keepalives=1,
             keepalives_idle=30,
             keepalives_interval=10,
             keepalives_count=5
         )
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("SET search_path TO public;")
-        return conn
 
     def execute(self, query, params=()):
         pg_query = query.replace("?", "%s")
-        with self._lock:
+        conn = self._pool.getconn()
+        try:
+            if conn.closed:
+                self._pool.putconn(conn, close=True)
+                conn = self._pool.getconn()
+            elif conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
+                conn.rollback()
+            cur = conn.cursor()
+            cur.execute(pg_query, params)
+            # Курсор psycopg2 (не server-side) уже получил и буферизует весь
+            # результат к этому моменту — fetchone()/fetchall() дальше по коду
+            # читают локальные данные и сети/соединения больше не касаются,
+            # так что возвращать соединение в пул прямо сейчас безопасно.
+            return cur
+        except Exception:
             try:
-                if self._conn.closed:
-                    self._conn = self._connect()
-                elif self._conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
-                    self._conn.rollback()
-                cur = self._conn.cursor()
-                cur.execute(pg_query, params)
-                return cur
-            except Exception:
-                try:
-                    self._conn.rollback()
-                except:
-                    pass
-                raise
-
-    def commit(self):
-        with self._lock:
-            try:
-                self._conn.commit()
+                conn.rollback()
             except:
                 pass
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    def commit(self):
+        # Каждое соединение в пуле работает в autocommit — отдельный commit()
+        # не нужен. Метод оставлен для совместимости с уже написанным кодом,
+        # которое вызывает db.conn.commit() по всему боту.
+        pass
 
 class Database:
     def __init__(self):
@@ -284,6 +293,9 @@ class Database:
         # (безопасно и для новой БД, и для уже существующей)
         self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_id TEXT DEFAULT ''")
         self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_type TEXT DEFAULT ''")
+        # Нужна для авточистки: удаляем по возрасту ЗАКРЫТИЯ, а не создания,
+        # и только закрытые тикеты — открытые обращения не трогаем никогда.
+        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TEXT DEFAULT ''")
 
         # Флаг «принял условия использования / политику конфиденциальности» —
         # чтобы приветственный экран показывался пользователю ровно один раз.
@@ -1471,7 +1483,7 @@ async def send_ticket_answer(message: Message, state: FSMContext):
             await bot.send_message(ticket[1], f"📩 <b>Ответ поддержки:</b>\n\n{message.text}")
         except:
             pass
-        await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET answer=?, status='Закрыт' WHERE id=?", (message.text, ticket_id))
+        await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET answer=?, status='Закрыт', closed_at=? WHERE id=?", (message.text, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticket_id))
         await asyncio.to_thread(db.conn.commit)
     await state.clear()
     await message.answer("✅ Ответ отправлен!", reply_markup=admin_back_keyboard())
@@ -1481,7 +1493,7 @@ async def close_ticket(callback: CallbackQuery):
     if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
         return
     ticket_id = int(callback.data.split("_")[1])
-    await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET status='Закрыт' WHERE id=?", (ticket_id,))
+    await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET status='Закрыт', closed_at=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticket_id))
     await asyncio.to_thread(db.conn.commit)
     await callback.answer("✅ Тикет закрыт")
     await admin_tickets(callback)
@@ -1642,6 +1654,45 @@ async def subscription_checker():
             logging.error(f"Ошибка проверки подписок: {e}")
         await asyncio.sleep(3600)
 
+LOGS_RETENTION_DAYS = 30      # admin_logs и notifications старше — удаляются
+CLOSED_TICKETS_RETENTION_DAYS = 60  # закрытые тикеты старше — удаляются (открытые не трогаем никогда)
+CLEANUP_INTERVAL_SECONDS = 24 * 3600  # раз в сутки
+
+async def db_cleanup_task():
+    """Автоочистка накопительных таблиц, чтобы БД (Neon) не забивалась
+    бесконечно растущими логами. Удаляет только то, что безопасно удалить:
+    - admin_logs: чистый журнал действий админов, старше 30 дней.
+    - notifications: старые отметки об отправленных уведомлениях, старше 30 дней.
+    - tickets: только УЖЕ ЗАКРЫТЫЕ обращения старше 60 дней — открытые тикеты
+      не удаляются никогда, вне зависимости от возраста.
+    users, promo_codes, used_promos, referrals — не трогаются вообще."""
+    while True:
+        try:
+            log_cutoff = (datetime.now() - timedelta(days=LOGS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+            ticket_cutoff = (datetime.now() - timedelta(days=CLOSED_TICKETS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+
+            cur1 = await asyncio.to_thread(db.conn.execute, "DELETE FROM admin_logs WHERE created_at < ?", (log_cutoff,))
+            deleted_logs = cur1.rowcount
+
+            cur2 = await asyncio.to_thread(db.conn.execute, "DELETE FROM notifications WHERE date < ?", (log_cutoff[:10],))
+            deleted_notifs = cur2.rowcount
+
+            cur3 = await asyncio.to_thread(
+                db.conn.execute,
+                "DELETE FROM tickets WHERE status='Закрыт' AND closed_at != '' AND closed_at < ?",
+                (ticket_cutoff,)
+            )
+            deleted_tickets = cur3.rowcount
+
+            if deleted_logs or deleted_notifs or deleted_tickets:
+                logging.info(
+                    f"🧹 Автоочистка БД: admin_logs -{deleted_logs}, "
+                    f"notifications -{deleted_notifs}, закрытых тикетов -{deleted_tickets}"
+                )
+        except Exception as e:
+            logging.error(f"Ошибка автоочистки БД: {e}")
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
 async def set_commands():
     commands = [
         BotCommand(command="start", description="🚀 Запустить бота"),
@@ -1700,6 +1751,7 @@ async def main():
     )
 
     asyncio.create_task(subscription_checker())
+    asyncio.create_task(db_cleanup_task())
 
     logging.info("✅ Stopka VPN запущен успешно!")
     try:
