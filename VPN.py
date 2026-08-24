@@ -1654,9 +1654,9 @@ async def subscription_checker():
             logging.error(f"Ошибка проверки подписок: {e}")
         await asyncio.sleep(3600)
 
-LOGS_RETENTION_DAYS = 30      # admin_logs и notifications старше — удаляются
-CLOSED_TICKETS_RETENTION_DAYS = 60  # закрытые тикеты старше — удаляются (открытые не трогаем никогда)
-CLEANUP_INTERVAL_SECONDS = 24 * 3600  # раз в сутки
+LOGS_RETENTION_DAYS = 7       # admin_logs и notifications старше — удаляются
+CLOSED_TICKETS_RETENTION_DAYS = 30  # закрытые тикеты старше — удаляются (открытые не трогаем никогда)
+CLEANUP_INTERVAL_SECONDS = 24 * 3600  # проверка раз в сутки
 
 async def db_cleanup_task():
     """Автоочистка накопительных таблиц, чтобы БД (Neon) не забивалась
