@@ -753,7 +753,8 @@ def build_profile_text(user_id, user_data):
         f"┌ 🆔 ID: <code>{user_id}</code>\n"
         f"├ ⭐ Подписка: Premium\n"
         f"├ 📱 Устройств: до 5\n"
-        f"├ 💳 Баланс: {balance}₽ · хватит на ≈{balance_days} дней\n"
+        f"├ ⏳ Дней подписки: {days}\n"
+        f"├ 💳 Баланс: {balance}₽ (доп. ≈{balance_days} дн.)\n"
         f"└ 🔑 VPN: {vpn_status}"
     )
     return text
@@ -790,6 +791,7 @@ async def start(message: Message):
     if user:
         if (user[1] or "") != username:
             await asyncio.to_thread(db.update_username, user_id, username)
+            user = await asyncio.to_thread(db.get_user, user_id)
     else:
         # Новый пользователь — add_user сам делает SELECT+INSERT,
         # для уже существующих users эта проверка теперь не дублируется
@@ -820,6 +822,7 @@ async def start(message: Message):
     # экран больше никогда не появится (accepted_terms=1 сохраняется в БД).
     accepted = len(user) > 12 and user[12] == 1
     if not accepted:
+        logging.info(f"start(): показан приветственный экран для user_id={user_id}, accepted_terms={user[12] if len(user) > 12 else 'НЕТ КОЛОНКИ'}")
         await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
         return
 
@@ -868,14 +871,26 @@ async def accept_terms(callback: CallbackQuery):
     expire = datetime.now() + timedelta(days=TRIAL_DAYS)
     expire_str = expire.strftime("%Y-%m-%d 23:59:59")
 
+    # Подстраховка: если строки пользователя почему-то ещё нет — создаём её,
+    # прежде чем обновлять (иначе UPDATE ... WHERE id=? тихо не найдёт строку
+    # и accepted_terms не сохранится).
     await asyncio.to_thread(
+        db.add_user, user_id, callback.from_user.username or "", callback.from_user.full_name
+    )
+
+    cur = await asyncio.to_thread(
         db.conn.execute,
         "UPDATE users SET accepted_terms=1, expire_date=?, status='Активно' WHERE id=?",
         (expire_str, user_id)
     )
+    if cur.rowcount != 1:
+        logging.error(f"accept_terms: UPDATE не затронул ни одной строки для user_id={user_id}")
     await asyncio.to_thread(db.conn.commit)
 
     user = await asyncio.to_thread(db.get_user, user_id)
+    if not user or len(user) <= 12 or user[12] != 1:
+        logging.error(f"accept_terms: после UPDATE accepted_terms всё ещё не установлен для user_id={user_id}, user={user}")
+
     await callback.answer(f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!", show_alert=True)
 
     text = build_profile_text(user_id, user)
@@ -1166,11 +1181,6 @@ async def promo_use(message: Message, state: FSMContext):
         await vpn_client.create_or_update_user(user_id, int(new_expire.timestamp()))
     except Exception as e:
         logging.error(f"Ошибка синхронизации с VPN панелью после промокода: {e}")
-
-    try:
-        await vpn_client.create_or_update_user(user_id, int(new_expire.timestamp()))
-    except:
-        pass
 
     await state.clear()
     await message.answer(f"✅ Промокод активирован! Добавлено +{days} дней.")
