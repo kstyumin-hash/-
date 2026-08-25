@@ -609,7 +609,7 @@ WELCOME_TEXT = (
 def profile_keyboard(is_admin=False):
     buttons = [
         [InlineKeyboardButton(text="💳 Оплата VPN", callback_data="payment")],
-        [InlineKeyboardButton(text="🔑 Мой ключ VLESS", callback_data="get_vless_key")],
+        [InlineKeyboardButton(text="📱 Добавить устройство", callback_data="get_vless_key")],
         [InlineKeyboardButton(text="🎁 Пригласить друга", callback_data="my_ref")],
         [InlineKeyboardButton(text="🎟 Промокод", callback_data="promo")]
     ]
@@ -737,8 +737,9 @@ def calculate_days(expire_str):
             return 0
     now = datetime.now()
     if expire > now:
-        delta = expire - now
-        return max(0, int(round(delta.total_seconds() / 86400)))
+        # Считаем по календарным датам, а не округлением сырой разницы во времени —
+        # иначе выдача "3 дней" в 9 утра могла показывать "4 дня" из-за округления.
+        return max(0, (expire.date() - now.date()).days)
     return 0
 
 def build_profile_text(user_id, user_data):
@@ -753,11 +754,24 @@ def build_profile_text(user_id, user_data):
         f"┌ 🆔 ID: <code>{user_id}</code>\n"
         f"├ ⭐ Подписка: Premium\n"
         f"├ 📱 Устройств: до 5\n"
-        f"├ ⏳ Дней подписки: {days}\n"
-        f"├ 💳 Баланс: {balance}₽ (доп. ≈{balance_days} дн.)\n"
+        f"├ 💳 Баланс: {balance}₽ · хватит на ≈{balance_days} дней\n"
         f"└ 🔑 VPN: {vpn_status}"
     )
     return text
+
+async def safe_edit(callback: CallbackQuery, text: str, reply_markup=None):
+    """Пытается отредактировать текст сообщения. Если это невозможно —
+    например, текущее сообщение с фото/файлом (как открытый тикет с
+    вложением), а Telegram не даёт превратить его в текстовое через edit —
+    удаляет его и отправляет новое текстовое сообщение вместо него."""
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except Exception:
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        await callback.message.answer(text, reply_markup=reply_markup)
 
 async def render_profile(user_id, target_message=None, callback=None, user=None):
     if user is None:
@@ -820,7 +834,18 @@ async def start(message: Message):
     # Пользователь ещё не принимал условия — показываем приветственный экран,
     # профиль до принятия не показывается. После нажатия «Подключить» этот
     # экран больше никогда не появится (accepted_terms=1 сохраняется в БД).
-    accepted = len(user) > 12 and user[12] == 1
+    #
+    # Доп. страховка: если у пользователя УЖЕ есть активная подписка (дни > 0),
+    # это само по себе доказывает, что он уже проходил «Подключить» раньше —
+    # получить дни иначе неоткуда. В этом случае экран не показываем и заодно
+    # чиним сам флаг в БД, даже если он почему-то не был выставлен.
+    has_active_subscription = calculate_days(user[3]) > 0
+    accepted = (len(user) > 12 and user[12] == 1) or has_active_subscription
+
+    if accepted and (len(user) <= 12 or user[12] != 1):
+        logging.warning(f"start(): accepted_terms был не выставлен при активной подписке — чиню для user_id={user_id}")
+        await asyncio.to_thread(db.conn.execute, "UPDATE users SET accepted_terms=1 WHERE id=?", (user_id,))
+
     if not accepted:
         logging.info(f"start(): показан приветственный экран для user_id={user_id}, accepted_terms={user[12] if len(user) > 12 else 'НЕТ КОЛОНКИ'}")
         await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
@@ -1238,7 +1263,8 @@ async def admin_panel(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Нет доступа. Вы не администратор!", show_alert=True)
         return
 
-    await callback.message.edit_text(
+    await safe_edit(
+        callback,
         "🛠 <b>Панель администратора</b>",
         reply_markup=admin_keyboard()
     )
@@ -1441,9 +1467,9 @@ async def admin_tickets(callback: CallbackQuery):
     cursor = await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE status='Открыт'")
     tickets = cursor.fetchall()
     if not tickets:
-        await callback.message.edit_text("🎟 Открытых тикетов нет", reply_markup=admin_back_keyboard())
+        await safe_edit(callback, "🎟 Открытых тикетов нет", reply_markup=admin_back_keyboard())
         return
-    await callback.message.edit_text("🎟 <b>Открытые обращения:</b>", reply_markup=ticket_list_keyboard(tickets))
+    await safe_edit(callback, "🎟 <b>Открытые обращения:</b>", reply_markup=ticket_list_keyboard(tickets))
 
 @dp.callback_query(F.data.startswith("ticket_"))
 async def open_ticket(callback: CallbackQuery):
@@ -1471,6 +1497,7 @@ async def open_ticket(callback: CallbackQuery):
         await callback.message.answer_document(document=file_id, caption=caption, reply_markup=keyboard)
     else:
         await callback.message.edit_text(caption, reply_markup=keyboard)
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("reply_"))
 async def reply_ticket(callback: CallbackQuery, state: FSMContext):
@@ -1479,7 +1506,8 @@ async def reply_ticket(callback: CallbackQuery, state: FSMContext):
     ticket_id = int(callback.data.split("_")[1])
     await state.update_data(ticket_id=ticket_id)
     await state.set_state(ReplyState.waiting_answer)
-    await callback.message.edit_text("✉️ Введите текст ответа:", reply_markup=admin_back_keyboard())
+    await safe_edit(callback, "✉️ Введите текст ответа:", reply_markup=admin_back_keyboard())
+    await callback.answer()
 
 @dp.message(ReplyState.waiting_answer)
 async def send_ticket_answer(message: Message, state: FSMContext):
