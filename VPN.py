@@ -226,28 +226,40 @@ class PGConnection:
 
     def execute(self, query, params=()):
         pg_query = query.replace("?", "%s")
-        conn = self._pool.getconn()
-        try:
-            if conn.closed:
-                self._pool.putconn(conn, close=True)
-                conn = self._pool.getconn()
-            elif conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
-                conn.rollback()
-            cur = conn.cursor()
-            cur.execute(pg_query, params)
-            # Курсор psycopg2 (не server-side) уже получил и буферизует весь
-            # результат к этому моменту — fetchone()/fetchall() дальше по коду
-            # читают локальные данные и сети/соединения больше не касаются,
-            # так что возвращать соединение в пул прямо сейчас безопасно.
-            return cur
-        except Exception:
+        last_error = None
+        # До 2 попыток: если соединение из пула оказалось мертво (например,
+        # Neon "усыпил" базу от простоя, оборвался сетевой канал и т.п.),
+        # выбрасываем именно ЭТО соединение и повторяем запрос на заведомо
+        # новом. Раньше битое соединение просто возвращалось обратно в пул
+        # и ломало ВСЕ следующие запросы, которым оно доставалось — это и
+        # был источник «бесконечной» ошибки у новых пользователей.
+        for attempt in range(2):
+            conn = self._pool.getconn()
             try:
-                conn.rollback()
-            except:
-                pass
-            raise
-        finally:
-            self._pool.putconn(conn)
+                if conn.closed:
+                    raise psycopg2.InterfaceError("connection already closed")
+                if conn.get_transaction_status() == ext.TRANSACTION_STATUS_INERROR:
+                    conn.rollback()
+                cur = conn.cursor()
+                cur.execute(pg_query, params)
+                self._pool.putconn(conn)
+                return cur
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                last_error = e
+                try:
+                    self._pool.putconn(conn, close=True)
+                except:
+                    pass
+                logging.warning(f"БД: мёртвое соединение из пула, пересоздаю и повторяю запрос (попытка {attempt + 1})")
+                continue
+            except Exception:
+                try:
+                    conn.rollback()
+                except:
+                    pass
+                self._pool.putconn(conn)
+                raise
+        raise last_error
 
     def commit(self):
         # Каждое соединение в пуле работает в autocommit — отдельный commit()
@@ -518,7 +530,7 @@ TARIFFS = {
 ############################################################
 
 TRIAL_DAYS = 3
-RUB_PER_DAY = 5  # курс пересчёта баланса в дни: 5₽ = 1 день
+RUB_PER_DAY = 5  # курс для будущего реального списания с баланса (сейчас не применяется в профиле — там показываются настоящие дни подписки)
 
 ############################################################
 # ЛЁГКИЙ АНТИСПАМ
@@ -746,7 +758,6 @@ def build_profile_text(user_id, user_data):
     days = calculate_days(user_data[3])
     vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
     balance = user_data[10] if len(user_data) > 10 else 0
-    balance_days = balance // RUB_PER_DAY
 
     text = (
         f"Stopka VPN🛡️\n\n"
@@ -754,7 +765,7 @@ def build_profile_text(user_id, user_data):
         f"┌ 🆔 ID: <code>{user_id}</code>\n"
         f"├ ⭐ Подписка: Premium\n"
         f"├ 📱 Устройств: до 5\n"
-        f"├ 💳 Баланс: {balance}₽ · хватит на ≈{balance_days} дней\n"
+        f"├ 💳 Баланс: {balance}₽ · Осталось: {days} дней\n"
         f"└ 🔑 VPN: {vpn_status}"
     )
     return text
