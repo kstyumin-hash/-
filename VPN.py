@@ -227,14 +227,23 @@ class PGConnection:
     def execute(self, query, params=()):
         pg_query = query.replace("?", "%s")
         last_error = None
-        # До 2 попыток: если соединение из пула оказалось мертво (например,
-        # Neon "усыпил" базу от простоя, оборвался сетевой канал и т.п.),
-        # выбрасываем именно ЭТО соединение и повторяем запрос на заведомо
-        # новом. Раньше битое соединение просто возвращалось обратно в пул
-        # и ломало ВСЕ следующие запросы, которым оно доставалось — это и
-        # был источник «бесконечной» ошибки у новых пользователей.
-        for attempt in range(2):
-            conn = self._pool.getconn()
+        # После долгого простоя Neon "усыпляет" базу — и ВСЕ соединения в пуле
+        # протухают одновременно (они простаивали вместе), а не одно. Поэтому
+        # попыток должно хватать на весь пул, а не на пару соединений — иначе
+        # первые запросы после сна всё равно с шансом получают битое соединение
+        # два раза подряд и падают с ошибкой (особенно у новых пользователей —
+        # на один /start уходит больше запросов к БД, а значит и больше шансов
+        # попасть на протухшее соединение несколько раз подряд).
+        max_attempts = self._pool.maxconn + 1
+        for attempt in range(max_attempts):
+            try:
+                conn = self._pool.getconn()
+            except pg_pool.PoolError as e:
+                # Пул временно исчерпан (много запросов одновременно) —
+                # короткая пауза и повтор, а не мгновенный отказ пользователю.
+                last_error = e
+                time.sleep(0.05)
+                continue
             try:
                 if conn.closed:
                     raise psycopg2.InterfaceError("connection already closed")
@@ -250,7 +259,7 @@ class PGConnection:
                     self._pool.putconn(conn, close=True)
                 except:
                     pass
-                logging.warning(f"БД: мёртвое соединение из пула, пересоздаю и повторяю запрос (попытка {attempt + 1})")
+                logging.warning(f"БД: мёртвое соединение из пула, пересоздаю и повторяю запрос (попытка {attempt + 1}/{max_attempts})")
                 continue
             except Exception:
                 try:
@@ -324,6 +333,19 @@ class Database:
 
         if not column_existed:
             self.conn.execute("UPDATE users SET accepted_terms=1")
+
+        # Отдельный, отдельно от accepted_terms, флаг "пробный период уже был
+        # выдан этому пользователю" — чтобы истечение/отключение подписки
+        # никогда не приводило к повторной раздаче бесплатных дней.
+        trial_col_existed = (self.conn.execute("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='users' AND column_name='trial_used'
+        """)).fetchone() is not None
+        self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used INTEGER DEFAULT 0")
+        if not trial_col_existed:
+            # Всех, кто уже принял условия (грандфазеринг выше) — считаем
+            # уже использовавшими пробный период, иначе им внезапно перевыдаст.
+            self.conn.execute("UPDATE users SET trial_used=1 WHERE accepted_terms=1")
         
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes(
@@ -842,23 +864,17 @@ async def start(message: Message):
             except Exception as e:
                 logging.error(f"Ошибка обработки реферала: {e}")
 
-    # Пользователь ещё не принимал условия — показываем приветственный экран,
-    # профиль до принятия не показывается. После нажатия «Подключить» этот
-    # экран больше никогда не появится (accepted_terms=1 сохраняется в БД).
-    #
-    # Доп. страховка: если у пользователя УЖЕ есть активная подписка (дни > 0),
-    # это само по себе доказывает, что он уже проходил «Подключить» раньше —
-    # получить дни иначе неоткуда. В этом случае экран не показываем и заодно
-    # чиним сам флаг в БД, даже если он почему-то не был выставлен.
-    has_active_subscription = calculate_days(user[3]) > 0
-    accepted = (len(user) > 12 and user[12] == 1) or has_active_subscription
-
-    if accepted and (len(user) <= 12 or user[12] != 1):
-        logging.warning(f"start(): accepted_terms был не выставлен при активной подписке — чиню для user_id={user_id}")
-        await asyncio.to_thread(db.conn.execute, "UPDATE users SET accepted_terms=1 WHERE id=?", (user_id,))
-
-    if not accepted:
-        logging.info(f"start(): показан приветственный экран для user_id={user_id}, accepted_terms={user[12] if len(user) > 12 else 'НЕТ КОЛОНКИ'}")
+    # Показываем приветственный экран, только если пробный период ЕЩЁ НИ РАЗУ
+    # не выдавался этому пользователю. Раньше здесь была проверка вида "или
+    # у пользователя уже активна подписка — тогда не показываем", но это
+    # ломалось ровно в момент, когда дни заканчивались (отключение админом
+    # или истечение срока): условие переставало выполняться, экран вылезал
+    # заново, а "Подключить" выдавал ещё один бесплатный пробный период —
+    # то есть подписку можно было продлевать бесплатно бесконечно. Теперь
+    # источник истины один: trial_used, который выставляется один раз и
+    # никогда не сбрасывается — ни отключением, ни истечением подписки.
+    trial_used = len(user) > 13 and user[13] == 1
+    if not trial_used:
         await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
         return
 
@@ -904,8 +920,6 @@ async def welcome_back(callback: CallbackQuery):
 @dp.callback_query(F.data == "accept_terms")
 async def accept_terms(callback: CallbackQuery):
     user_id = callback.from_user.id
-    expire = datetime.now() + timedelta(days=TRIAL_DAYS)
-    expire_str = expire.strftime("%Y-%m-%d 23:59:59")
 
     # Подстраховка: если строки пользователя почему-то ещё нет — создаём её,
     # прежде чем обновлять (иначе UPDATE ... WHERE id=? тихо не найдёт строку
@@ -914,20 +928,31 @@ async def accept_terms(callback: CallbackQuery):
         db.add_user, user_id, callback.from_user.username or "", callback.from_user.full_name
     )
 
-    cur = await asyncio.to_thread(
-        db.conn.execute,
-        "UPDATE users SET accepted_terms=1, expire_date=?, status='Активно' WHERE id=?",
-        (expire_str, user_id)
-    )
-    if cur.rowcount != 1:
-        logging.error(f"accept_terms: UPDATE не затронул ни одной строки для user_id={user_id}")
-    await asyncio.to_thread(db.conn.commit)
-
     user = await asyncio.to_thread(db.get_user, user_id)
-    if not user or len(user) <= 12 or user[12] != 1:
-        logging.error(f"accept_terms: после UPDATE accepted_terms всё ещё не установлен для user_id={user_id}, user={user}")
+    trial_used = user is not None and len(user) > 13 and user[13] == 1
 
-    await callback.answer(f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!", show_alert=True)
+    if not trial_used:
+        # Пробный период даётся ровно один раз в жизни аккаунта.
+        expire = datetime.now() + timedelta(days=TRIAL_DAYS)
+        expire_str = expire.strftime("%Y-%m-%d 23:59:59")
+        cur = await asyncio.to_thread(
+            db.conn.execute,
+            "UPDATE users SET accepted_terms=1, trial_used=1, expire_date=?, status='Активно' WHERE id=?",
+            (expire_str, user_id)
+        )
+        if cur.rowcount != 1:
+            logging.error(f"accept_terms: UPDATE не затронул ни одной строки для user_id={user_id}")
+        alert_text = f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!"
+    else:
+        # Условия принимаются просто для галочки — пробный период уже был
+        # использован раньше, повторно дни не начисляем.
+        await asyncio.to_thread(db.conn.execute, "UPDATE users SET accepted_terms=1 WHERE id=?", (user_id,))
+        alert_text = "✅ Готово!"
+
+    await asyncio.to_thread(db.conn.commit)
+    user = await asyncio.to_thread(db.get_user, user_id)
+
+    await callback.answer(alert_text, show_alert=True)
 
     text = build_profile_text(user_id, user)
     is_admin_flag = (user_id == OWNER_ID) or (user is not None and user[5] == 1)
