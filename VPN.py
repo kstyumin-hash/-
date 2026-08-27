@@ -72,7 +72,7 @@ bot = Bot(
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-BOT_USERNAME = None  # кэшируется один раз при старте
+BOT_USERNAME = None  # кэшируется один раз при старте, чтобы не дёргать get_me() на каждый клик
 
 ############################################################
 # VPN API CLIENT (Marzban / Xray)
@@ -85,6 +85,8 @@ class VPNClient:
         self._session = None
 
     def _get_session(self):
+        # Один переиспользуемый session вместо нового TCP/TLS-хендшейка на каждый запрос —
+        # ощутимо ускоряет обращения к панели (Marzban).
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
         return self._session
@@ -119,6 +121,10 @@ class VPNClient:
                 async with session.put(
                     f"{self.base_url}/api/user/{username}",
                     headers=headers,
+                    # status: "active" — важно указывать при КАЖДОМ продлении, иначе если
+                    # пользователь ранее был отключен по истечении срока, при выдаче новых
+                    # дней (оплата/промокод/админ) он остаётся отключённым в Marzban,
+                    # хотя бот уже показывает активную подписку.
                     json={"expire": expire_timestamp, "status": "active"}
                 ) as update_resp:
                     if update_resp.status == 200:
@@ -143,6 +149,8 @@ class VPNClient:
         return ""
 
     async def disable_user(self, user_id):
+        # Реально отключает доступ на стороне Marzban (а не только в БД бота) —
+        # без этого Happ/v2rayTun продолжали бы работать с ключом после истечения дней.
         if not self.token:
             await self.login()
         headers = {"Authorization": f"Bearer {self.token}"}
@@ -189,6 +197,9 @@ rate_limiter = RateLimiter()
 IntegrityError = psycopg2.errors.lookup(psycopg2.errorcodes.UNIQUE_VIOLATION)
 
 class _PoolWithSetup(pg_pool.ThreadedConnectionPool):
+    """Пул соединений psycopg2: при создании КАЖДОГО нового физического
+    соединения применяет те же настройки, что раньше выставлялись один раз
+    для единственного общего соединения (autocommit, search_path)."""
     def _connect(self, key=None):
         conn = super()._connect(key)
         conn.autocommit = True
@@ -196,9 +207,48 @@ class _PoolWithSetup(pg_pool.ThreadedConnectionPool):
             cur.execute("SET search_path TO public;")
         return conn
 
+class _FetchedResult:
+    """Лёгкая замена курсора: хранит уже вычитанные из БД строки и rowcount.
+
+    ВАЖНО: раньше PGConnection.execute() возвращал вызывающему коду "живой"
+    psycopg2-курсор ПОСЛЕ того, как физическое соединение уже было отдано
+    обратно в пул (putconn). Пока вызывающий код ещё не успел сделать
+    fetchone()/fetchall() на этом курсоре, то же самое соединение из пула мог
+    забрать другой параллельный запрос (например, несколько человек почти
+    одновременно жмут /start по реферальной ссылке) и начать выполнять на
+    нём свой запрос — psycopg2-соединение не рассчитано на одновременное
+    использование двумя запросами сразу. Из-за этого /start мог падать с
+    ошибками у пользователей, пришедших по ссылке во время всплеска трафика.
+    Теперь строки вычитываются и rowcount фиксируется ДО того, как
+    соединение возвращается в пул — соединение больше никем не используется
+    в момент возврата."""
+    __slots__ = ("_rows", "_pos", "rowcount")
+
+    def __init__(self, rows, rowcount):
+        self._rows = rows
+        self._pos = 0
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return rows
+
 class PGConnection:
     def __init__(self, dsn, minconn=1, maxconn=10):
         self._dsn = dsn
+        # Раньше было одно соединение на весь бот (с локом на очередь запросов) —
+        # это было БЕЗОПАСНО, но все запросы шли строго по очереди, один за другим.
+        # Пул даёт до `maxconn` реально параллельных соединений: несколько
+        # пользователей могут обращаться к БД одновременно без взаимного ожидания.
+        # ThreadedConnectionPool сам по себе потокобезопасен — свой лок не нужен.
         self._pool = _PoolWithSetup(
             minconn, maxconn, dsn,
             connect_timeout=10,
@@ -211,11 +261,20 @@ class PGConnection:
     def execute(self, query, params=()):
         pg_query = query.replace("?", "%s")
         last_error = None
+        # После долгого простоя Neon "усыпляет" базу — и ВСЕ соединения в пуле
+        # протухают одновременно (они простаивали вместе), а не одно. Поэтому
+        # попыток должно хватать на весь пул, а не на пару соединений — иначе
+        # первые запросы после сна всё равно с шансом получают битое соединение
+        # два раза подряд и падают с ошибкой (особенно у новых пользователей —
+        # на один /start уходит больше запросов к БД, а значит и больше шансов
+        # попасть на протухшее соединение несколько раз подряд).
         max_attempts = self._pool.maxconn + 1
         for attempt in range(max_attempts):
             try:
                 conn = self._pool.getconn()
             except pg_pool.PoolError as e:
+                # Пул временно исчерпан (много запросов одновременно) —
+                # короткая пауза и повтор, а не мгновенный отказ пользователю.
                 last_error = e
                 time.sleep(0.05)
                 continue
@@ -226,15 +285,24 @@ class PGConnection:
                     conn.rollback()
                 cur = conn.cursor()
                 cur.execute(pg_query, params)
+                # Вычитываем результат и rowcount, пока соединение ещё у нас,
+                # и только потом отдаём его обратно в пул (см. _FetchedResult
+                # выше — почему это критично для параллельных запросов).
+                if cur.description is not None:
+                    rows = cur.fetchall()
+                else:
+                    rows = []
+                rowcount = cur.rowcount
+                cur.close()
                 self._pool.putconn(conn)
-                return cur
+                return _FetchedResult(rows, rowcount)
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 last_error = e
                 try:
                     self._pool.putconn(conn, close=True)
                 except:
                     pass
-                logging.warning(f"БД: мёртвое соединение из пула, пересоздаю (попытка {attempt + 1}/{max_attempts})")
+                logging.warning(f"БД: мёртвое соединение из пула, пересоздаю и повторяю запрос (попытка {attempt + 1}/{max_attempts})")
                 continue
             except Exception:
                 try:
@@ -246,6 +314,9 @@ class PGConnection:
         raise last_error
 
     def commit(self):
+        # Каждое соединение в пуле работает в autocommit — отдельный commit()
+        # не нужен. Метод оставлен для совместимости с уже написанным кодом,
+        # которое вызывает db.conn.commit() по всему боту.
         pass
 
 class Database:
@@ -282,26 +353,41 @@ class Database:
             status TEXT
         )
         """)
+        # Вложения к тикетам (фото/файл) — добавляем колонки, если их ещё нет
+        # (безопасно и для новой БД, и для уже существующей)
         self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_id TEXT DEFAULT ''")
         self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_type TEXT DEFAULT ''")
+        # Нужна для авточистки: удаляем по возрасту ЗАКРЫТИЯ, а не создания,
+        # и только закрытые тикеты — открытые обращения не трогаем никогда.
         self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TEXT DEFAULT ''")
 
+        # Флаг «принял условия использования / политику конфиденциальности» —
+        # чтобы приветственный экран показывался пользователю ровно один раз.
+        # Если колонки ещё не было — это миграция на уже работающей базе:
+        # всех текущих пользователей амнистируем (иначе им внезапно покажется
+        # приветственный экран и слетит уже оплаченная подписка).
         cur = self.conn.execute("""
             SELECT 1 FROM information_schema.columns
             WHERE table_name='users' AND column_name='accepted_terms'
         """)
         column_existed = cur.fetchone() is not None
+
         self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS accepted_terms INTEGER DEFAULT 0")
 
         if not column_existed:
             self.conn.execute("UPDATE users SET accepted_terms=1")
 
+        # Отдельный, отдельно от accepted_terms, флаг "пробный период уже был
+        # выдан этому пользователю" — чтобы истечение/отключение подписки
+        # никогда не приводило к повторной раздаче бесплатных дней.
         trial_col_existed = (self.conn.execute("""
             SELECT 1 FROM information_schema.columns
             WHERE table_name='users' AND column_name='trial_used'
         """)).fetchone() is not None
         self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used INTEGER DEFAULT 0")
         if not trial_col_existed:
+            # Всех, кто уже принял условия (грандфазеринг выше) — считаем
+            # уже использовавшими пробный период, иначе им внезапно перевыдаст.
             self.conn.execute("UPDATE users SET trial_used=1 WHERE accepted_terms=1")
         
         self.conn.execute("""
@@ -495,7 +581,7 @@ class PromoCreateState(StatesGroup):
     waiting_max_uses = State()
 
 ############################################################
-# ТАРИФЫ И КОНСТАНТЫ
+# ТАРИФЫ
 ############################################################
 
 TARIFFS = {
@@ -504,8 +590,18 @@ TARIFFS = {
     "year": {"name": "год", "days": 365, "price": 1600, "stars": 1600}
 }
 
+############################################################
+# ЮРИДИЧЕСКИЕ ДОКУМЕНТЫ
+############################################################
+
 TRIAL_DAYS = 3
-RUB_PER_DAY = 5
+RUB_PER_DAY = 5  # декоративный курс для профиля: показывается как {дни}×5₽, без реального смысла
+
+############################################################
+# ЛЁГКИЙ АНТИСПАМ
+############################################################
+# Простой кулдаун по действиям (не строгий, чтобы не мешать обычным пользователям) —
+# защищает только от быстрого повторного долбления одной и той же кнопки/попыток.
 
 _last_action_time = {}
 
@@ -521,12 +617,61 @@ def is_rate_limited(user_id: int, action: str, cooldown: float) -> bool:
 TERMS_TEXT = """<b>УСЛОВИЯ ИСПОЛЬЗОВАНИЯ</b>
 
 <b>1. Общие положения и терминология</b>
-Настоящие Условия использования регулируют отношения между Пользователем и Сервисом Stopka VPN..."""
+Настоящие Условия использования (далее — «Документ») регулируют отношения между Пользователем (далее — «Вы», «Ваш», «Субъект») и Сервисом Stopka VPN (далее — «Мы», «Наш», «Оператор») в рамках предоставления услуг по изменению IP-адреса и шифрованию интернет-трафика. Начиная использовать Сервис, Вы подтверждаете, что полностью ознакомились с положениями Документа и принимаете их без каких-либо оговорок, исключений и условностей, за исключением случаев, прямо предусмотренных действующим законодательством Российской Федерации.
+
+<b>2. Предмет соглашения и объем предоставляемых услуг</b>
+Оператор обязуется предоставить Пользователю доступ к программно-аппаратному комплексу, обеспечивающему перенаправление интернет-соединения через удаленные серверы, расположенные в различных географических зонах. Пользователь понимает и соглашается, что фактическая скорость передачи данных, задержка (пинг) и стабильность соединения зависят от множества факторов, находящихся вне контроля Оператора, включая, но не ограничиваясь: загруженность каналов связи, качество оборудования провайдера, погодные условия, солнечную активность и действия органов государственной власти.
+
+<b>3. Права и обязанности Пользователя</b>
+3.1. Вы имеете право подключаться к любому доступному серверу, представленному в списке, за исключением случаев технического обслуживания.
+3.2. Вы имеете право прекратить использование Сервиса в любой момент без объяснения причин.
+3.3. Вы имеете право обращаться в службу поддержки, однако Оператор не гарантирует мгновенного ответа в ночное время, выходные и праздничные дни, установленные на территории РФ.
+3.4. Вы имеете право использовать Сервис на нескольких устройствах, однако несете ответственность за сохранность своего логина и пароля от третьих лиц.
+
+<b>4. Ограничения и запреты</b>
+Пользователю строго запрещается:
+4.1. Использовать Сервис для проведения несанкционированных атак на информационные системы других лиц (DDoS, брутфорс, сканирование портов).
+4.2. Распространять через соединение Stopka VPN материалы, пропагандирующие насилие, экстремизм, изготовление взрывчатых веществ или наркотических средств.
+4.3. Нарушать авторские и смежные права, используя Сервис для массового нелегального скачивания торрентов в странах, где это преследуется по закону.
+4.4. Перепродавать доступ к своему аккаунту третьим лицам или передавать его в аренду.
+
+<b>5. Ограничение ответственности Оператора</b>
+ОПЕРАТОР НЕ НЕСЕТ ОТВЕТСТВЕННОСТИ за любые косвенные, случайные или штрафные убытки Пользователя, возникшие в результате использования или невозможности использования Сервиса, включая, но не ограничиваясь: потерю данных, снижение производительности устройства, блокировку аккаунтов в социальных сетях по причине смены геолокации, а также за отказ в доступе к сайтам, если они используют собственные алгоритмы блокировки VPN-трафика. Сервис предоставляется «как есть» (AS-IS) без каких-либо явных или подразумеваемых гарантий.
+
+<b>6. Срок действия и пролонгация</b>
+Настоящие Условия вступают в силу с момента нажатия кнопки «Подключить» и действуют бессрочно до момента полного удаления Вашего аккаунта или прекращения деятельности Оператора. В случае изменения текста Условий, Оператор уведомляет Пользователя путем публикации новой редакции на официальном сайте за 10 (десять) календарных дней до вступления изменений в силу. Ваше молчаливое согласие с новой редакцией считается подтвержденным, если Вы продолжаете использовать Сервис по истечении указанного срока."""
 
 PRIVACY_TEXT = """<b>ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ</b>
 
 <b>1. Какие данные собираются</b>
-Для обеспечения работы Сервиса Stopka VPN может обрабатывать следующую информацию..."""
+Для идентификации Пользователя и обеспечения корректной работы Сервиса Stopka VPN может автоматически обрабатывать следующие категории информации:
+1.1. Технические данные: Ваш реальный IP-адрес в момент подключения, MAC-адрес сетевого интерфейса, тип операционной системы, версия приложения, уникальный идентификатор устройства (Device ID), а также сведения о модели смартфона или компьютера.
+1.2. Сессионная информация: Время входа в систему, время выхода, общий объем переданных и принятых мегабайт (трафик), а также выбранная страна сервера для подключения.
+1.3. Платежная информация: Если Вы оформляете платную подписку, мы передаем Ваши данные (номер телефона или адрес электронной почты) в процессинговые центры, но не храним полные номера банковских карт на своих серверах (используется токенизация).
+
+<b>2. Цели обработки данных</b>
+2.1. Обеспечение стабильности работы сети и балансировки нагрузки между серверами.
+2.2. Своевременное информирование Вас о технических сбоях и плановых технических работах.
+2.3. Предотвращение мошеннических действий, попыток взлома аккаунтов и неестественно высокой нагрузки на инфраструктуру.
+2.4. Ведения внутренней статистики для улучшения пользовательского опыта и интерфейса приложения.
+
+<b>3. Передача данных третьим лицам</b>
+Мы обязуемся НЕ передавать Ваши персональные данные коммерческим структурам для целей таргетированной рекламы без Вашего отдельного согласия. Однако, действуя в строгом соответствии с Федеральным законом № 242-ФЗ и № 374-ФЗ, Оператор оставляет за собой право предоставлять сведения о фактах подключения (время, IP, объем трафика) уполномоченным государственным органам (Роскомнадзору, ФСБ, МВД) на основании официального мотивированного запроса, оформленного в установленном законодательством порядке. В иных случаях данные не разглашаются.
+
+<b>4. Хранение и сроки уничтожения</b>
+Все логи подключений хранятся в зашифрованном виде на серверах, расположенных на территории Российской Федерации, в течение срока, необходимого для достижения целей обработки, но не менее 6 (шести) месяцев с момента окончания сессии. По истечении указанного срока данные подлежат автоматической анонимизации либо полному удалению с использованием методов гарантированного уничтожения информации.
+
+<b>5. Ваши права как Субъекта данных</b>
+В соответствии с ФЗ-152 «О персональных данных», Вы имеете право:
+5.1. Запросить полную выписку обо всех Ваших данных, хранящихся у Оператора (один раз в год бесплатно).
+5.2. Требовать уточнения, блокировки или уничтожения Ваших данных, если они являются неполными, устаревшими или полученными незаконным путем.
+5.3. Отозвать свое согласие на обработку персональных данных путем отправки письменного заявления на электронную почту поддержки (в этом случае доступ к Сервису будет прекращен в течение 3 (трех) рабочих дней).
+
+<b>6. Cookie и сторонние аналитические модули</b>
+При использовании веб-версии Сервиса применяются технические cookie-файлы, необходимые для аутентификации и хранения настроек языка. Мы не используем шпионские скрипты и не отслеживаем историю Ваших посещений веб-страниц в открытом виде, так как весь трафик внутри туннеля зашифрован и не подлежит анализу с нашей стороны.
+
+<b>7. Меры безопасности</b>
+Оператор применяет современные криптографические протоколы (включая AES-256) для защиты передаваемых данных. Внутренний доступ к серверам с логами строго регламентирован и имеют только 3 (три) уполномоченных сотрудника отдела технической эксплуатации, подписавших соглашение о неразглашении."""
 
 WELCOME_TEXT = (
     "🛡 <b>Stopka VPN</b>\n\n"
@@ -645,7 +790,7 @@ def legal_back_keyboard():
     ])
 
 ############################################################
-# MIDDLEWARES & HELPERS
+# MIDDLEWARES
 ############################################################
 
 @dp.message.middleware()
@@ -654,6 +799,10 @@ async def rate_limit_middleware(handler, message: Message, data: dict):
         await message.answer("⏳ Слишком много запросов. Подождите немного.")
         return
     return await handler(message, data)
+
+############################################################
+# HELPER FUNCTIONS
+############################################################
 
 def calculate_days(expire_str):
     try:
@@ -665,13 +814,15 @@ def calculate_days(expire_str):
             return 0
     now = datetime.now()
     if expire > now:
+        # Считаем по календарным датам, а не округлением сырой разницы во времени —
+        # иначе выдача "3 дней" в 9 утра могла показывать "4 дня" из-за округления.
         return max(0, (expire.date() - now.date()).days)
     return 0
 
 def build_profile_text(user_id, user_data):
     days = calculate_days(user_data[3])
     vpn_status = "✅ Активен" if days > 0 else "❌ Не активен"
-    balance = days * RUB_PER_DAY
+    balance = days * RUB_PER_DAY  # чисто декоративно: 5₽ = 1 день, без реального смысла
 
     text = (
         f"Stopka VPN🛡️\n\n"
@@ -685,6 +836,10 @@ def build_profile_text(user_id, user_data):
     return text
 
 async def safe_edit(callback: CallbackQuery, text: str, reply_markup=None):
+    """Пытается отредактировать текст сообщения. Если это невозможно —
+    например, текущее сообщение с фото/файлом (как открытый тикет с
+    вложением), а Telegram не даёт превратить его в текстовое через edit —
+    удаляет его и отправляет новое текстовое сообщение вместо него."""
     try:
         await callback.message.edit_text(text, reply_markup=reply_markup)
     except Exception:
@@ -703,6 +858,7 @@ async def render_profile(user_id, target_message=None, callback=None, user=None)
             user = await asyncio.to_thread(db.get_user, user_id)
 
     text = build_profile_text(user_id, user)
+    # is_admin известен из уже полученной строки пользователя — не дёргаем БД повторно
     is_admin_flag = (user_id == OWNER_ID) or (user is not None and user[5] == 1)
     kb = profile_keyboard(is_admin_flag)
 
@@ -727,6 +883,8 @@ async def start(message: Message):
             await asyncio.to_thread(db.update_username, user_id, username)
             user = await asyncio.to_thread(db.get_user, user_id)
     else:
+        # Новый пользователь — add_user сам делает SELECT+INSERT,
+        # для уже существующих users эта проверка теперь не дублируется
         await asyncio.to_thread(db.add_user, user_id, username, message.from_user.full_name)
         user = await asyncio.to_thread(db.get_user, user_id)
 
@@ -740,19 +898,29 @@ async def start(message: Message):
             try:
                 inviter = int(ref.replace("STOPKA", ""))
                 if inviter != user_id:
-                    cursor = await asyncio.to_thread(db.conn.execute, "SELECT invited_by FROM users WHERE id=?", (user_id,))
-                    existing = cursor.fetchone()
-                    if existing and existing[0] == 0:
-                        await asyncio.to_thread(db.conn.execute, "UPDATE users SET invited_by=? WHERE id=?", (inviter, user_id))
+                    # invited_by=0 проверяется прямо в WHERE самого UPDATE (атомарно),
+                    # а не отдельным SELECT заранее — исключает гонку при двойном /start.
+                    bind_cur = await asyncio.to_thread(
+                        db.conn.execute,
+                        "UPDATE users SET invited_by=? WHERE id=? AND invited_by=0",
+                        (inviter, user_id)
+                    )
+                    if bind_cur.rowcount == 1:
                         await asyncio.to_thread(db.conn.execute, "INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0) ON CONFLICT (user_id) DO NOTHING", (user_id, inviter))
                         await asyncio.to_thread(db.conn.commit)
             except Exception as e:
                 logging.error(f"Ошибка обработки реферала: {e}")
 
-    # Гарантированная подгрузка свежих данных пользователя
-    user = await asyncio.to_thread(db.get_user, user_id)
-    trial_used = user is not None and len(user) > 13 and user[13] == 1
-
+    # Показываем приветственный экран, только если пробный период ЕЩЁ НИ РАЗУ
+    # не выдавался этому пользователю. Раньше здесь была проверка вида "или
+    # у пользователя уже активна подписка — тогда не показываем", но это
+    # ломалось ровно в момент, когда дни заканчивались (отключение админом
+    # или истечение срока): условие переставало выполняться, экран вылезал
+    # заново, а "Подключить" выдавал ещё один бесплатный пробный период —
+    # то есть подписку можно было продлевать бесплатно бесконечно. Теперь
+    # источник истины один: trial_used, который выставляется один раз и
+    # никогда не сбрасывается — ни отключением, ни истечением подписки.
+    trial_used = len(user) > 13 and user[13] == 1
     if not trial_used:
         await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
         return
@@ -763,7 +931,9 @@ async def start(message: Message):
 async def help_command(message: Message):
     await message.answer(
         "🛡 <b>Поддержка Stopka VPN</b>\n\n"
-        "Опишите свой вопрос или проблему, а также приложите фото или файл — так мы сможем помочь быстрее.",
+        "Не переживайте — если что-то пошло не так, мы обязательно разберёмся и поможем 🤝\n\n"
+        "Опишите свой вопрос или проблему, а также приложите фото или файл (например, скриншот ошибки или чек об оплате) — так мы сможем помочь быстрее.\n\n"
+        "Нажмите кнопку ниже, чтобы написать администраторам:",
         reply_markup=support_keyboard()
     )
 
@@ -772,7 +942,7 @@ async def about_command(message: Message):
     await message.answer("👨‍💻 Создатели: @prostokiril, @ll1_what")
 
 ############################################################
-# ПРИВЕТСТВЕННЫЙ ЭКРАН & ПОЛИТИКИ
+# ПРИВЕТСТВЕННЫЙ ЭКРАН (принятие условий)
 ############################################################
 
 @dp.callback_query(F.data == "show_terms")
@@ -798,26 +968,36 @@ async def welcome_back(callback: CallbackQuery):
 async def accept_terms(callback: CallbackQuery):
     user_id = callback.from_user.id
 
+    # Подстраховка: если строки пользователя почему-то ещё нет — создаём её,
+    # прежде чем обновлять (иначе UPDATE ... WHERE id=? тихо не найдёт строку
+    # и accepted_terms не сохранится).
     await asyncio.to_thread(
         db.add_user, user_id, callback.from_user.username or "", callback.from_user.full_name
     )
 
-    user = await asyncio.to_thread(db.get_user, user_id)
-    trial_used = user is not None and len(user) > 13 and user[13] == 1
-
-    if not trial_used:
-        # Пробный период выдается strictly один раз за всю историю
-        expire = datetime.now() + timedelta(days=TRIAL_DAYS)
-        expire_str = expire.strftime("%Y-%m-%d 23:59:59")
-        await asyncio.to_thread(
-            db.conn.execute,
-            "UPDATE users SET accepted_terms=1, trial_used=1, expire_date=?, status='Активно' WHERE id=?",
-            (expire_str, user_id)
-        )
+    # Пробный период даётся ровно один раз в жизни аккаунта. Условие
+    # "trial_used=0" стоит прямо в WHERE самого UPDATE (а не решается заранее
+    # отдельным SELECT) — так выдача атомарна: даже если пользователь successит
+    # нажать "Подключить" два раза почти одновременно (двойной тап,
+    # нестабильная сеть и т.п.), только ОДИН из двух запросов реально
+    # обновит строку и получит trial_used=0->1, второй увидит rowcount=0
+    # и не выдаст дни повторно.
+    expire = datetime.now() + timedelta(days=TRIAL_DAYS)
+    expire_str = expire.strftime("%Y-%m-%d 23:59:59")
+    cur = await asyncio.to_thread(
+        db.conn.execute,
+        "UPDATE users SET accepted_terms=1, trial_used=1, expire_date=?, status='Активно' "
+        "WHERE id=? AND trial_used=0",
+        (expire_str, user_id)
+    )
+    if cur.rowcount == 1:
         alert_text = f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!"
     else:
+        # Пробный период уже был использован раньше (или гонка — его только что
+        # выдал параллельный запрос) — повторно дни не начисляем, просто
+        # фиксируем принятие условий "для галочки".
         await asyncio.to_thread(db.conn.execute, "UPDATE users SET accepted_terms=1 WHERE id=?", (user_id,))
-        alert_text = "✅ Условия приняты!"
+        alert_text = "✅ Готово!"
 
     await asyncio.to_thread(db.conn.commit)
     user = await asyncio.to_thread(db.get_user, user_id)
@@ -848,7 +1028,7 @@ async def get_vless_key(callback: CallbackQuery):
     days = calculate_days(user[3])
 
     if days <= 0:
-        await callback.answer("❌ Подписка неактивна. Оплатите дни, чтобы получить ключ.", show_alert=True)
+        await callback.answer("❌ Подписка неактивна. Оплатите дни, чтобы получить ключ для Happ.", show_alert=True)
         return
 
     vless_key = user[11]
@@ -860,7 +1040,7 @@ async def get_vless_key(callback: CallbackQuery):
             await asyncio.to_thread(db.conn.execute, "UPDATE users SET vless_key=? WHERE id=?", (vless_key, user_id))
             await asyncio.to_thread(db.conn.commit)
         except Exception as e:
-            logging.error(f"Ошибка генерации ключа: {e}")
+            logging.error(f"Ошибка генерации ключа через API: {e}")
 
     if not vless_key:
         vless_key = f"vless://error-check-api-connection@panel:443?encryption=none&security=reality#StopkaVPN"
@@ -980,11 +1160,14 @@ async def process_successful_payment(message: Message):
                 except:
                     pass
 
-                if not user[7]: 
+                # Реферальный бонус — начисляется один раз, в момент ПЕРВОЙ реальной
+                # оплаты приглашённого (а не за сам факт перехода по ссылке — так
+                # бонус не накрутить фейковыми регистрациями без покупки).
+                if not user[7]:  # first_payment ещё не было
                     await asyncio.to_thread(db.conn.execute, "UPDATE users SET first_payment=1 WHERE id=?", (user_id,))
                     await asyncio.to_thread(db.conn.commit)
 
-                    inviter_id = user[6]
+                    inviter_id = user[6]  # invited_by
                     if inviter_id:
                         row = (await asyncio.to_thread(
                             db.conn.execute, "SELECT bonus_given FROM referrals WHERE user_id=?", (user_id,)
@@ -1273,7 +1456,8 @@ async def admin_toggle_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminToggleState.waiting_username)
     await callback.message.edit_text(
         "👑 <b>Назначить / Удалить админа</b>\n\n"
-        "Введите `@username` или `ID` пользователя:",
+        "Введите `@username` или `ID` пользователя:\n"
+        "Если пользователь админ — статус заберётся, если не админ — выдастся.",
         reply_markup=admin_back_keyboard()
     )
     await callback.answer()
@@ -1463,7 +1647,9 @@ async def promo_clear_confirm(callback: CallbackQuery):
         return
     await callback.message.edit_text(
         "🗑 <b>Очистка промокодов</b>\n\n"
-        "Будут удалены все промокоды, которые уже <b>полностью использованы</b>.\n\n"
+        "Будут удалены все промокоды, которые уже <b>полностью использованы</b> "
+        "(использований = максимум).\n"
+        "Промокоды, у которых остались свободные активации, не тронутся.\n\n"
         "Продолжить?",
         reply_markup=promo_clear_confirm_keyboard()
     )
@@ -1529,7 +1715,7 @@ async def broadcast_start(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(BroadcastState.waiting_text)
     await callback.message.edit_text(
-        "📢 Отправьте сообщение для рассылки:",
+        "📢 Отправьте сообщение для рассылки (текст, фото или файл с подписью):",
         reply_markup=admin_back_keyboard()
     )
 
@@ -1541,6 +1727,7 @@ async def broadcast_finish(message: Message, state: FSMContext):
     count = 0
     for u in users:
         try:
+            # copy_to пересылает любой тип сообщения (текст, фото, файл) как есть
             await message.copy_to(chat_id=u[0])
             count += 1
             await asyncio.sleep(0.05)
@@ -1550,7 +1737,7 @@ async def broadcast_finish(message: Message, state: FSMContext):
     await message.answer(f"✅ Рассылка завершена! Доставлено {count} пользователям.", reply_markup=admin_back_keyboard())
 
 ############################################################
-# BACKGROUND TASKS
+# SUBSCRIPTION & EXPIRATION CHECKER TASK
 ############################################################
 
 async def subscription_checker():
@@ -1565,9 +1752,12 @@ async def subscription_checker():
                     continue
                 
                 now = datetime.now()
+                # Если время вышло, а статус всё ещё Активно — отключаем
                 if expire < now and status == "Активно":
                     await asyncio.to_thread(db.disable_subscription, user_id)
                     try:
+                        # Отключаем сам ключ на панели Marzban, иначе Happ/v2rayTun
+                        # продолжат работать даже после истечения подписки в боте
                         await vpn_client.disable_user(user_id)
                     except Exception as e:
                         logging.error(f"Не удалось отключить пользователя {user_id} в VPN панели: {e}")
@@ -1576,6 +1766,7 @@ async def subscription_checker():
                     except:
                         pass
                 
+                # Уведомление за 3 дня
                 days = (expire - now).days
                 if days == 3 and status == "Активно" and not await asyncio.to_thread(db.notification_sent, user_id, "3days"):
                     try:
@@ -1587,28 +1778,40 @@ async def subscription_checker():
             logging.error(f"Ошибка проверки подписок: {e}")
         await asyncio.sleep(3600)
 
-LOGS_RETENTION_DAYS = 7
-CLOSED_TICKETS_RETENTION_DAYS = 30
-CLEANUP_INTERVAL_SECONDS = 24 * 3600
+LOGS_RETENTION_DAYS = 7       # admin_logs и notifications старше — удаляются
+CLOSED_TICKETS_RETENTION_DAYS = 30  # закрытые тикеты старше — удаляются (открытые не трогаем никогда)
+CLEANUP_INTERVAL_SECONDS = 24 * 3600  # проверка раз в сутки
 
 async def db_cleanup_task():
+    """Автоочистка накопительных таблиц, чтобы БД (Neon) не забивалась
+    бесконечно растущими логами. Удаляет только то, что безопасно удалить:
+    - admin_logs: чистый журнал действий админов, старше 30 дней.
+    - notifications: старые отметки об отправленных уведомлениях, старше 30 дней.
+    - tickets: только УЖЕ ЗАКРЫТЫЕ обращения старше 60 дней — открытые тикеты
+      не удаляются никогда, вне зависимости от возраста.
+    users, promo_codes, used_promos, referrals — не трогаются вообще."""
     while True:
         try:
             log_cutoff = (datetime.now() - timedelta(days=LOGS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
             ticket_cutoff = (datetime.now() - timedelta(days=CLOSED_TICKETS_RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
             cur1 = await asyncio.to_thread(db.conn.execute, "DELETE FROM admin_logs WHERE created_at < ?", (log_cutoff,))
+            deleted_logs = cur1.rowcount
+
             cur2 = await asyncio.to_thread(db.conn.execute, "DELETE FROM notifications WHERE date < ?", (log_cutoff[:10],))
+            deleted_notifs = cur2.rowcount
+
             cur3 = await asyncio.to_thread(
                 db.conn.execute,
                 "DELETE FROM tickets WHERE status='Закрыт' AND closed_at != '' AND closed_at < ?",
                 (ticket_cutoff,)
             )
+            deleted_tickets = cur3.rowcount
 
-            if cur1.rowcount or cur2.rowcount or cur3.rowcount:
+            if deleted_logs or deleted_notifs or deleted_tickets:
                 logging.info(
-                    f"🧹 Автоочистка БД: admin_logs -{cur1.rowcount}, "
-                    f"notifications -{cur2.rowcount}, закрытых тикетов -{cur3.rowcount}"
+                    f"🧹 Автоочистка БД: admin_logs -{deleted_logs}, "
+                    f"notifications -{deleted_notifs}, закрытых тикетов -{deleted_tickets}"
                 )
         except Exception as e:
             logging.error(f"Ошибка автоочистки БД: {e}")
@@ -1664,6 +1867,7 @@ async def main():
     bot_info = await bot.get_me()
     BOT_USERNAME = bot_info.username
 
+    # Независимые задачи запуска — параллельно, а не одна за другой
     await asyncio.gather(
         set_commands(),
         start_web_server(),
