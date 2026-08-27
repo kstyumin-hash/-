@@ -191,6 +191,23 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 
 ############################################################
+# PER-USER LOCK
+############################################################
+# aiogram по умолчанию обрабатывает каждый апдейт как отдельную независимую
+# asyncio-задачу — то есть если один и тот же пользователь присылает два
+# /start подряд быстро (или /start и нажатие "Подключить" почти одновременно),
+# оба обработчика реально выполняются ПАРАЛЛЕЛЬНО, а не по очереди. Каждый
+# запрос к БД сам по себе консистентен (см. фикс PGConnection.execute выше),
+# но между несколькими awaited шагами ОДНОГО обработчика другой параллельный
+# обработчик того же user_id может успеть вклиниться и сработать на
+# промежуточном/устаревшем состоянии (например, второй /start стартует и
+# читает профиль раньше, чем первый /start успел дописать username и
+# закоммититься). Лок на user_id сериализует такие пересекающиеся вызовы —
+# второй дождётся, пока первый полностью завершится, и увидит уже
+# гарантированно актуальное состояние.
+user_locks = defaultdict(asyncio.Lock)
+
+############################################################
 # DATABASE
 ############################################################
 
@@ -877,55 +894,57 @@ async def start(message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or ""
 
-    user = await asyncio.to_thread(db.get_user, user_id)
-    if user:
-        if (user[1] or "") != username:
-            await asyncio.to_thread(db.update_username, user_id, username)
-            user = await asyncio.to_thread(db.get_user, user_id)
-    else:
-        # Новый пользователь — add_user сам делает SELECT+INSERT,
-        # для уже существующих users эта проверка теперь не дублируется
-        await asyncio.to_thread(db.add_user, user_id, username, message.from_user.full_name)
+    # Сериализуем обработку по user_id — см. комментарий у user_locks выше.
+    async with user_locks[user_id]:
         user = await asyncio.to_thread(db.get_user, user_id)
+        if user:
+            if (user[1] or "") != username:
+                await asyncio.to_thread(db.update_username, user_id, username)
+                user = await asyncio.to_thread(db.get_user, user_id)
+        else:
+            # Новый пользователь — add_user сам делает SELECT+INSERT,
+            # для уже существующих users эта проверка теперь не дублируется
+            await asyncio.to_thread(db.add_user, user_id, username, message.from_user.full_name)
+            user = await asyncio.to_thread(db.get_user, user_id)
 
-    if user_id == OWNER_ID:
-        await asyncio.to_thread(db.set_admin, user_id, True)
-    
-    args = message.text.split()
-    if len(args) > 1:
-        ref = args[1]
-        if ref.startswith("STOPKA"):
-            try:
-                inviter = int(ref.replace("STOPKA", ""))
-                if inviter != user_id:
-                    # invited_by=0 проверяется прямо в WHERE самого UPDATE (атомарно),
-                    # а не отдельным SELECT заранее — исключает гонку при двойном /start.
-                    bind_cur = await asyncio.to_thread(
-                        db.conn.execute,
-                        "UPDATE users SET invited_by=? WHERE id=? AND invited_by=0",
-                        (inviter, user_id)
-                    )
-                    if bind_cur.rowcount == 1:
-                        await asyncio.to_thread(db.conn.execute, "INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0) ON CONFLICT (user_id) DO NOTHING", (user_id, inviter))
-                        await asyncio.to_thread(db.conn.commit)
-            except Exception as e:
-                logging.error(f"Ошибка обработки реферала: {e}")
+        if user_id == OWNER_ID:
+            await asyncio.to_thread(db.set_admin, user_id, True)
 
-    # Показываем приветственный экран, только если пробный период ЕЩЁ НИ РАЗУ
-    # не выдавался этому пользователю. Раньше здесь была проверка вида "или
-    # у пользователя уже активна подписка — тогда не показываем", но это
-    # ломалось ровно в момент, когда дни заканчивались (отключение админом
-    # или истечение срока): условие переставало выполняться, экран вылезал
-    # заново, а "Подключить" выдавал ещё один бесплатный пробный период —
-    # то есть подписку можно было продлевать бесплатно бесконечно. Теперь
-    # источник истины один: trial_used, который выставляется один раз и
-    # никогда не сбрасывается — ни отключением, ни истечением подписки.
-    trial_used = len(user) > 13 and user[13] == 1
-    if not trial_used:
-        await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
-        return
+        args = message.text.split()
+        if len(args) > 1:
+            ref = args[1]
+            if ref.startswith("STOPKA"):
+                try:
+                    inviter = int(ref.replace("STOPKA", ""))
+                    if inviter != user_id:
+                        # invited_by=0 проверяется прямо в WHERE самого UPDATE (атомарно),
+                        # а не отдельным SELECT заранее — исключает гонку при двойном /start.
+                        bind_cur = await asyncio.to_thread(
+                            db.conn.execute,
+                            "UPDATE users SET invited_by=? WHERE id=? AND invited_by=0",
+                            (inviter, user_id)
+                        )
+                        if bind_cur.rowcount == 1:
+                            await asyncio.to_thread(db.conn.execute, "INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0) ON CONFLICT (user_id) DO NOTHING", (user_id, inviter))
+                            await asyncio.to_thread(db.conn.commit)
+                except Exception as e:
+                    logging.error(f"Ошибка обработки реферала: {e}")
 
-    await render_profile(user_id, target_message=message, user=user)
+        # Показываем приветственный экран, только если пробный период ЕЩЁ НИ РАЗУ
+        # не выдавался этому пользователю. Раньше здесь была проверка вида "или
+        # у пользователя уже активна подписка — тогда не показываем", но это
+        # ломалось ровно в момент, когда дни заканчивались (отключение админом
+        # или истечение срока): условие переставало выполняться, экран вылезал
+        # заново, а "Подключить" выдавал ещё один бесплатный пробный период —
+        # то есть подписку можно было продлевать бесплатно бесконечно. Теперь
+        # источник истины один: trial_used, который выставляется один раз и
+        # никогда не сбрасывается — ни отключением, ни истечением подписки.
+        trial_used = len(user) > 13 and user[13] == 1
+        if not trial_used:
+            await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
+            return
+
+        await render_profile(user_id, target_message=message, user=user)
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
@@ -968,39 +987,42 @@ async def welcome_back(callback: CallbackQuery):
 async def accept_terms(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    # Подстраховка: если строки пользователя почему-то ещё нет — создаём её,
-    # прежде чем обновлять (иначе UPDATE ... WHERE id=? тихо не найдёт строку
-    # и accepted_terms не сохранится).
-    await asyncio.to_thread(
-        db.add_user, user_id, callback.from_user.username or "", callback.from_user.full_name
-    )
+    # Тот же лок, что и в /start — иначе "Подключить" мог бы обработаться
+    # параллельно с ещё выполняющимся /start того же пользователя.
+    async with user_locks[user_id]:
+        # Подстраховка: если строки пользователя почему-то ещё нет — создаём её,
+        # прежде чем обновлять (иначе UPDATE ... WHERE id=? тихо не найдёт строку
+        # и accepted_terms не сохранится).
+        await asyncio.to_thread(
+            db.add_user, user_id, callback.from_user.username or "", callback.from_user.full_name
+        )
 
-    # Пробный период даётся ровно один раз в жизни аккаунта. Условие
-    # "trial_used=0" стоит прямо в WHERE самого UPDATE (а не решается заранее
-    # отдельным SELECT) — так выдача атомарна: даже если пользователь successит
-    # нажать "Подключить" два раза почти одновременно (двойной тап,
-    # нестабильная сеть и т.п.), только ОДИН из двух запросов реально
-    # обновит строку и получит trial_used=0->1, второй увидит rowcount=0
-    # и не выдаст дни повторно.
-    expire = datetime.now() + timedelta(days=TRIAL_DAYS)
-    expire_str = expire.strftime("%Y-%m-%d 23:59:59")
-    cur = await asyncio.to_thread(
-        db.conn.execute,
-        "UPDATE users SET accepted_terms=1, trial_used=1, expire_date=?, status='Активно' "
-        "WHERE id=? AND trial_used=0",
-        (expire_str, user_id)
-    )
-    if cur.rowcount == 1:
-        alert_text = f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!"
-    else:
-        # Пробный период уже был использован раньше (или гонка — его только что
-        # выдал параллельный запрос) — повторно дни не начисляем, просто
-        # фиксируем принятие условий "для галочки".
-        await asyncio.to_thread(db.conn.execute, "UPDATE users SET accepted_terms=1 WHERE id=?", (user_id,))
-        alert_text = "✅ Готово!"
+        # Пробный период даётся ровно один раз в жизни аккаунта. Условие
+        # "trial_used=0" стоит прямо в WHERE самого UPDATE (а не решается заранее
+        # отдельным SELECT) — так выдача атомарна: даже если пользователь успевает
+        # нажать "Подключить" два раза почти одновременно (двойной тап,
+        # нестабильная сеть и т.п.), только ОДИН из двух запросов реально
+        # обновит строку и получит trial_used=0->1, второй увидит rowcount=0
+        # и не выдаст дни повторно.
+        expire = datetime.now() + timedelta(days=TRIAL_DAYS)
+        expire_str = expire.strftime("%Y-%m-%d 23:59:59")
+        cur = await asyncio.to_thread(
+            db.conn.execute,
+            "UPDATE users SET accepted_terms=1, trial_used=1, expire_date=?, status='Активно' "
+            "WHERE id=? AND trial_used=0",
+            (expire_str, user_id)
+        )
+        if cur.rowcount == 1:
+            alert_text = f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!"
+        else:
+            # Пробный период уже был использован раньше (или гонка — его только что
+            # выдал параллельный запрос) — повторно дни не начисляем, просто
+            # фиксируем принятие условий "для галочки".
+            await asyncio.to_thread(db.conn.execute, "UPDATE users SET accepted_terms=1 WHERE id=?", (user_id,))
+            alert_text = "✅ Готово!"
 
-    await asyncio.to_thread(db.conn.commit)
-    user = await asyncio.to_thread(db.get_user, user_id)
+        await asyncio.to_thread(db.conn.commit)
+        user = await asyncio.to_thread(db.get_user, user_id)
 
     await callback.answer(alert_text, show_alert=True)
 
