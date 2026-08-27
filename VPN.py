@@ -941,6 +941,11 @@ async def start(message: Message):
         # никогда не сбрасывается — ни отключением, ни истечением подписки.
         trial_used = len(user) > 13 and user[13] == 1
         if not trial_used:
+            logging.warning(
+                f"/start: показываю экран политики для user_id={user_id}, "
+                f"raw row (accepted_terms, trial_used)="
+                f"{(user[12] if len(user) > 12 else 'N/A', user[13] if len(user) > 13 else 'N/A')}"
+            )
             await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
             return
 
@@ -1014,12 +1019,14 @@ async def accept_terms(callback: CallbackQuery):
         )
         if cur.rowcount == 1:
             alert_text = f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!"
+            logging.info(f"accept_terms: user_id={user_id} — пробный период выдан, trial_used выставлен в 1 (rowcount=1)")
         else:
             # Пробный период уже был использован раньше (или гонка — его только что
             # выдал параллельный запрос) — повторно дни не начисляем, просто
             # фиксируем принятие условий "для галочки".
             await asyncio.to_thread(db.conn.execute, "UPDATE users SET accepted_terms=1 WHERE id=?", (user_id,))
             alert_text = "✅ Готово!"
+            logging.warning(f"accept_terms: user_id={user_id} — UPDATE trial_used=0->1 не затронул строк (rowcount={cur.rowcount}), пробный период НЕ выдан повторно")
 
         await asyncio.to_thread(db.conn.commit)
         user = await asyncio.to_thread(db.get_user, user_id)
