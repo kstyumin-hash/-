@@ -360,6 +360,13 @@ class Database:
             vless_key TEXT DEFAULT ''
         )
         """)
+        # vless_key был только внутри CREATE TABLE IF NOT EXISTS выше — для уже
+        # существующей таблицы (как в проде) это ничего не добавляет, колонки
+        # не было физически. Добавляем её той же миграцией, что и
+        # accepted_terms/trial_used ниже — иначе INSERT нового пользователя
+        # (упоминает vless_key) падает с UndefinedColumn для КАЖДОГО нового
+        # пользователя, реферал тут вообще ни при чём.
+        self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vless_key TEXT DEFAULT ''")
         
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS tickets(
