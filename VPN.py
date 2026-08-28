@@ -460,19 +460,22 @@ class Database:
         self.conn.commit()
 
     def add_user(self, user_id, username, name):
-        cursor = self.conn.execute("SELECT id FROM users WHERE id=?", (user_id,))
-        if cursor.fetchone():
-            return
-        
+        # INSERT ... RETURNING вместо SELECT-затем-INSERT-затем-SELECT — три
+        # обращения к БД для нового пользователя превращаются в одно. Меньше
+        # круговых обращений — меньше шансов зацепить нестабильность пула
+        # именно в тот момент, когда новый пользователь первый раз жмёт /start.
         expire = datetime.now() + timedelta(days=0)
         expire_str = expire.strftime("%Y-%m-%d %H:%M:%S")
-        
-        self.conn.execute("""
+
+        cursor = self.conn.execute("""
             INSERT INTO users (id, username, name, expire_date, status, is_admin, invited_by, first_payment, last_tariff, username_history, balance, vless_key) 
             VALUES(?,?,?,?,?,0,0,0,'',?,0,'')
             ON CONFLICT (id) DO NOTHING
+            RETURNING *
         """, (user_id, username or "", name or "", expire_str, "Отключено", json.dumps([])))
+        row = cursor.fetchone()
         self.conn.commit()
+        return row
 
     def get_user(self, user_id):
         cursor = self.conn.execute("SELECT * FROM users WHERE id=?", (user_id,))
@@ -920,10 +923,13 @@ async def start(message: Message):
                 await asyncio.to_thread(db.update_username, user_id, username)
                 user = await asyncio.to_thread(db.get_user, user_id)
         else:
-            # Новый пользователь — add_user сам делает SELECT+INSERT,
-            # для уже существующих users эта проверка теперь не дублируется
-            await asyncio.to_thread(db.add_user, user_id, username, message.from_user.full_name)
-            user = await asyncio.to_thread(db.get_user, user_id)
+            # Новый пользователь — add_user делает один INSERT...RETURNING и
+            # сразу отдаёт готовую строку, без отдельных SELECT до и после.
+            user = await asyncio.to_thread(db.add_user, user_id, username, message.from_user.full_name)
+            if user is None:
+                # Редкая гонка: кто-то другой успел создать эту же строку
+                # между нашей проверкой и INSERT — просто дочитываем её.
+                user = await asyncio.to_thread(db.get_user, user_id)
 
         if user_id == OWNER_ID:
             await asyncio.to_thread(db.set_admin, user_id, True)
