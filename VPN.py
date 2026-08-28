@@ -406,6 +406,12 @@ class Database:
             # Всех, кто уже принял условия (грандфазеринг выше) — считаем
             # уже использовавшими пробный период, иначе им внезапно перевыдаст.
             self.conn.execute("UPDATE users SET trial_used=1 WHERE accepted_terms=1")
+        logging.info(f"create_tables(): миграция trial_used — column_existed_before={trial_col_existed}")
+        diag = self.conn.execute("""
+            SELECT column_name, ordinal_position FROM information_schema.columns
+            WHERE table_name='users' ORDER BY ordinal_position
+        """).fetchall()
+        logging.info(f"create_tables(): текущие колонки users по порядку = {diag}")
         
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes(
@@ -471,6 +477,18 @@ class Database:
     def get_user(self, user_id):
         cursor = self.conn.execute("SELECT * FROM users WHERE id=?", (user_id,))
         return cursor.fetchone()
+
+    def get_trial_status(self, user_id):
+        """Отдельный запрос ИМЕННО по названиям колонок accepted_terms/trial_used,
+        а не по позиции в SELECT * — так индексация в user[12]/user[13] никогда
+        не сможет разъехаться со схемой, что бы ни случилось с порядком колонок."""
+        cursor = self.conn.execute(
+            "SELECT accepted_terms, trial_used FROM users WHERE id=?", (user_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return (0, 0)
+        return (row[0] or 0, row[1] or 0)
 
     def get_username(self, username):
         clean_user = username.replace("@", "").strip()
@@ -939,12 +957,13 @@ async def start(message: Message):
         # то есть подписку можно было продлевать бесплатно бесконечно. Теперь
         # источник истины один: trial_used, который выставляется один раз и
         # никогда не сбрасывается — ни отключением, ни истечением подписки.
-        trial_used = len(user) > 13 and user[13] == 1
+        accepted_flag, trial_used_flag = await asyncio.to_thread(db.get_trial_status, user_id)
+        trial_used = trial_used_flag == 1
         if not trial_used:
             logging.warning(
                 f"/start: показываю экран политики для user_id={user_id}, "
-                f"raw row (accepted_terms, trial_used)="
-                f"{(user[12] if len(user) > 12 else 'N/A', user[13] if len(user) > 13 else 'N/A')}"
+                f"по имени колонки (accepted_terms, trial_used)=({accepted_flag}, {trial_used_flag}), "
+                f"raw row len={len(user)}"
             )
             await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
             return
@@ -1014,7 +1033,7 @@ async def accept_terms(callback: CallbackQuery):
         cur = await asyncio.to_thread(
             db.conn.execute,
             "UPDATE users SET accepted_terms=1, trial_used=1, expire_date=?, status='Активно' "
-            "WHERE id=? AND trial_used=0",
+            "WHERE id=? AND (trial_used=0 OR trial_used IS NULL)",
             (expire_str, user_id)
         )
         if cur.rowcount == 1:
