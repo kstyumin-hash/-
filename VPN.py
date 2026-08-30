@@ -11,6 +11,7 @@ import psycopg2.errorcodes
 import psycopg2.extensions as ext
 import psycopg2.pool as pg_pool
 import json
+import uuid
 import os
 import html
 import time
@@ -47,7 +48,7 @@ OWNER_ID = int(os.environ.get("OWNER_ID", 5604869107))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.getenv("PORT", 8080))
 
-# Настройки панели VPN (Marzban / Xray API)
+# Настройки панели VPN (3x-ui)
 VPN_API_URL = os.environ.get("VPN_API_URL", "https://your-vpn-panel.com")
 VPN_ADMIN_USERNAME = os.environ.get("VPN_ADMIN_USERNAME", "admin")
 VPN_ADMIN_PASSWORD = os.environ.get("VPN_ADMIN_PASSWORD", "password")
@@ -75,18 +76,36 @@ dp = Dispatcher(storage=storage)
 BOT_USERNAME = None  # кэшируется один раз при старте, чтобы не дёргать get_me() на каждый клик
 
 ############################################################
-# VPN API CLIENT (Marzban / Xray)
+# VPN API CLIENT (3x-ui)
 ############################################################
 
 class VPNClient:
+    """Клиент для панели 3x-ui (https://github.com/MHSanaei/3x-ui).
+
+    В отличие от Marzban, у 3x-ui:
+    - авторизация через cookie сессии (не Bearer-токен) — держим один
+      aiohttp.ClientSession на весь клиент, он сам хранит cookie между запросами;
+    - клиенты создаются/обновляются через inbound: нужно знать ID нужного
+      inbound'а (переменная окружения THREEXUI_INBOUND_ID);
+    - есть НАТИВНОЕ ограничение по количеству устройств — поле limitIp
+      у клиента (переменная окружения THREEXUI_DEVICE_LIMIT, по умолчанию 5);
+    - готовая ссылка не возвращается напрямую, как в Marzban — используется
+      сервис подписки 3x-ui: https://host:SUB_PORT/SUB_PATH/{subId}.
+    """
     def __init__(self):
-        self.base_url = VPN_API_URL
-        self.token = None
+        self.base_url = VPN_API_URL.rstrip("/")
+        self.username = VPN_ADMIN_USERNAME
+        self.password = VPN_ADMIN_PASSWORD
+        self.inbound_id = int(os.environ.get("THREEXUI_INBOUND_ID", "1"))
+        self.device_limit = int(os.environ.get("THREEXUI_DEVICE_LIMIT", "5"))
+        self.sub_port = os.environ.get("THREEXUI_SUB_PORT", "")
+        self.sub_path = os.environ.get("THREEXUI_SUB_PATH", "sub").strip("/")
         self._session = None
+        self._logged_in = False
 
     def _get_session(self):
-        # Один переиспользуемый session вместо нового TCP/TLS-хендшейка на каждый запрос —
-        # ощутимо ускоряет обращения к панели (Marzban).
+        # Один переиспользуемый session — он же хранит cookie сессии 3x-ui
+        # между запросами, поэтому логиниться заново на каждый вызов не нужно.
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
         return self._session
@@ -99,73 +118,150 @@ class VPNClient:
         session = self._get_session()
         try:
             async with session.post(
-                f"{self.base_url}/api/admin/token",
-                data={"username": VPN_ADMIN_USERNAME, "password": VPN_ADMIN_PASSWORD}
+                f"{self.base_url}/login",
+                data={"username": self.username, "password": self.password}
             ) as resp:
-                if resp.status == 200:
+                try:
                     data = await resp.json()
-                    self.token = data.get("access_token")
+                except Exception:
+                    data = {}
+                self._logged_in = resp.status == 200 and data.get("success", False)
+                if not self._logged_in:
+                    logging.error(f"3x-ui: не удалось авторизоваться (status={resp.status})")
         except Exception as e:
-            logging.error(f"Ошибка авторизации в VPN панели: {e}")
+            logging.error(f"Ошибка авторизации в 3x-ui: {e}")
+            self._logged_in = False
+
+    async def _api_get(self, path):
+        if not self._logged_in:
+            await self.login()
+        session = self._get_session()
+        for attempt in range(2):
+            try:
+                async with session.get(f"{self.base_url}{path}") as resp:
+                    if resp.status == 401 and attempt == 0:
+                        await self.login()
+                        continue
+                    try:
+                        return await resp.json()
+                    except Exception:
+                        return None
+            except Exception as e:
+                logging.error(f"Ошибка запроса к 3x-ui ({path}): {e}")
+                return None
+        return None
+
+    async def _api_post(self, path, payload):
+        if not self._logged_in:
+            await self.login()
+        session = self._get_session()
+        for attempt in range(2):
+            try:
+                async with session.post(
+                    f"{self.base_url}{path}",
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
+                ) as resp:
+                    if resp.status == 401 and attempt == 0:
+                        await self.login()
+                        continue
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        # 3x-ui иногда отвечает пустой строкой вместо JSON — известная особенность панели.
+                        data = None
+                    return resp.status == 200 and data is not None and data.get("success", False)
+            except Exception as e:
+                logging.error(f"Ошибка запроса к 3x-ui ({path}): {e}")
+                return False
+        return False
+
+    async def _find_existing_client(self, email):
+        """Возвращает (client_dict) существующего клиента по email или None."""
+        data = await self._api_get(f"/panel/api/inbounds/get/{self.inbound_id}")
+        if not data or not data.get("success") or not data.get("obj"):
+            return None
+        try:
+            settings = json.loads(data["obj"].get("settings", "{}"))
+        except Exception:
+            return None
+        for client in settings.get("clients", []):
+            if client.get("email") == email:
+                return client
+        return None
+
+    def _build_sub_link(self, sub_id):
+        if not sub_id:
+            return ""
+        if self.sub_port:
+            host = self.base_url.split("://")[-1].split("/")[0].split(":")[0]
+            scheme = "https" if self.base_url.startswith("https") else "http"
+            return f"{scheme}://{host}:{self.sub_port}/{self.sub_path}/{sub_id}"
+        # Сервер подписки не настроен через ENV — отдаём хотя бы sub_id,
+        # чтобы не возвращать пустую строку молча.
+        return sub_id
 
     async def create_or_update_user(self, user_id, expire_timestamp):
-        if not self.token:
-            await self.login()
+        email = f"user_{user_id}"
+        expiry_ms = int(expire_timestamp) * 1000  # 3x-ui ждёт миллисекунды, не секунды
 
-        headers = {"Authorization": f"Bearer {self.token}"}
-        username = f"user_{user_id}"
-        session = self._get_session()
+        existing = await self._find_existing_client(email)
 
-        async with session.get(f"{self.base_url}/api/user/{username}", headers=headers) as resp:
-            if resp.status == 200:
-                async with session.put(
-                    f"{self.base_url}/api/user/{username}",
-                    headers=headers,
-                    # status: "active" — важно указывать при КАЖДОМ продлении, иначе если
-                    # пользователь ранее был отключен по истечении срока, при выдаче новых
-                    # дней (оплата/промокод/админ) он остаётся отключённым в Marzban,
-                    # хотя бот уже показывает активную подписку.
-                    json={"expire": expire_timestamp, "status": "active"}
-                ) as update_resp:
-                    if update_resp.status == 200:
-                        data = await update_resp.json()
-                        links = data.get("links", [])
-                        return links[0] if links else ""
-            elif resp.status == 404:
-                async with session.post(
-                    f"{self.base_url}/api/user",
-                    headers=headers,
-                    json={
-                        "username": username,
-                        "expire": expire_timestamp,
-                        "proxies": {"vless": {"flow": ""}},
-                        "inbounds": {"vless": ["VLESS Reality"]}
-                    }
-                ) as create_resp:
-                    if create_resp.status == 200:
-                        data = await create_resp.json()
-                        links = data.get("links", [])
-                        return links[0] if links else ""
-        return ""
+        if existing:
+            client_uuid = existing.get("id")
+            sub_id = existing.get("subId") or uuid.uuid4().hex
+            client_payload = {
+                "id": client_uuid,
+                "email": email,
+                "enable": True,
+                "expiryTime": expiry_ms,
+                "limitIp": self.device_limit,
+                "totalGB": existing.get("totalGB", 0),
+                "tgId": existing.get("tgId", ""),
+                "subId": sub_id,
+                "reset": existing.get("reset", 0),
+                "flow": existing.get("flow", "")
+            }
+            ok = await self._api_post(
+                f"/panel/api/inbounds/updateClient/{client_uuid}",
+                {"id": self.inbound_id, "settings": json.dumps({"clients": [client_payload]})}
+            )
+        else:
+            client_uuid = str(uuid.uuid4())
+            sub_id = uuid.uuid4().hex
+            client_payload = {
+                "id": client_uuid,
+                "email": email,
+                "enable": True,
+                "expiryTime": expiry_ms,
+                "limitIp": self.device_limit,
+                "totalGB": 0,
+                "tgId": "",
+                "subId": sub_id,
+                "reset": 0,
+                "flow": ""
+            }
+            ok = await self._api_post(
+                "/panel/api/inbounds/addClient",
+                {"id": self.inbound_id, "settings": json.dumps({"clients": [client_payload]})}
+            )
+
+        if not ok:
+            return ""
+        return self._build_sub_link(sub_id)
 
     async def disable_user(self, user_id):
-        # Реально отключает доступ на стороне Marzban (а не только в БД бота) —
+        # Реально отключает доступ на стороне 3x-ui (а не только в БД бота) —
         # без этого Happ/v2rayTun продолжали бы работать с ключом после истечения дней.
-        if not self.token:
-            await self.login()
-        headers = {"Authorization": f"Bearer {self.token}"}
-        username = f"user_{user_id}"
-        session = self._get_session()
-        try:
-            async with session.put(
-                f"{self.base_url}/api/user/{username}",
-                headers=headers,
-                json={"status": "disabled"}
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            logging.error(f"Ошибка отключения пользователя в VPN панели: {e}")
+        email = f"user_{user_id}"
+        existing = await self._find_existing_client(email)
+        if not existing:
             return False
+        existing["enable"] = False
+        return await self._api_post(
+            f"/panel/api/inbounds/updateClient/{existing['id']}",
+            {"id": self.inbound_id, "settings": json.dumps({"clients": [existing]})}
+        )
 
 vpn_client = VPNClient()
 
@@ -995,7 +1091,7 @@ async def help_command(message: Message):
 
 @dp.message(Command("about"))
 async def about_command(message: Message):
-    await message.answer("👨‍💻 Создатели: @prostokiril, @ll1_what")
+    await message.answer("👨‍💻 Создатели: @prostokiril, @ll1_coo")
 
 ############################################################
 # ПРИВЕТСТВЕННЫЙ ЭКРАН (принятие условий)
@@ -1817,7 +1913,7 @@ async def subscription_checker():
                 if expire < now and status == "Активно":
                     await asyncio.to_thread(db.disable_subscription, user_id)
                     try:
-                        # Отключаем сам ключ на панели Marzban, иначе Happ/v2rayTun
+                        # Отключаем сам ключ на панели 3x-ui, иначе Happ/v2rayTun
                         # продолжат работать даже после истечения подписки в боте
                         await vpn_client.disable_user(user_id)
                     except Exception as e:
