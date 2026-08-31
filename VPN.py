@@ -1728,7 +1728,7 @@ async def open_ticket(callback: CallbackQuery):
         [InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close_{ticket_id}")],
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")]
     ])
-    caption = f"🎟 <b>Тикет #{ticket[0]}</b>\nПользователь ID: {ticket[1]}\n\nСообщение:\n{ticket[2] or '—'}"
+    caption = f"🎟 <b>Тикет #{ticket[0]}</b>\nПользователь ID: <code>{ticket[1]}</code>\n\nСообщение:\n{ticket[2] or '—'}"
     file_id = ticket[5] if len(ticket) > 5 else ""
     file_type = ticket[6] if len(ticket) > 6 else ""
 
