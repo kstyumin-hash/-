@@ -1091,7 +1091,14 @@ async def help_command(message: Message):
 
 @dp.message(Command("about"))
 async def about_command(message: Message):
-    await message.answer("👨‍💻 Создатели: @prostokiril, @ll1_coo")
+    await message.answer(
+        "Не успели рассмотреть соглашения? Посмотрите ещё раз!\n\n"
+        "ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ:\n"
+        "https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-09-02-81\n\n"
+        "Условия пользования:\n"
+        "https://telegra.ph/USLOVIYA-POLZOVANIYA-09-02-2\n\n"
+        "👨‍💻 Создатели: @prostokiril, @ll1_coo"
+    )
 
 ############################################################
 # ПРИВЕТСТВЕННЫЙ ЭКРАН (принятие условий)
