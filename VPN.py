@@ -263,6 +263,43 @@ class VPNClient:
             {"id": self.inbound_id, "settings": json.dumps({"clients": [existing]})}
         )
 
+    async def delete_client(self, client_uuid):
+        # Полное удаление клиента на панели 3x-ui — именно это делает старый
+        # ключ нерабочим (в отличие от updateClient, id/subId остаются старыми).
+        if not self._logged_in:
+            await self.login()
+        session = self._get_session()
+        for attempt in range(2):
+            try:
+                async with session.post(
+                    f"{self.base_url}/panel/api/inbounds/{self.inbound_id}/delClient/{client_uuid}"
+                ) as resp:
+                    if resp.status == 401 and attempt == 0:
+                        await self.login()
+                        continue
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = None
+                    return resp.status == 200 and data is not None and data.get("success", False)
+            except Exception as e:
+                logging.error(f"Ошибка удаления клиента в 3x-ui: {e}")
+                return False
+        return False
+
+    async def reset_user_key(self, user_id, expire_timestamp):
+        """Полностью пересоздаёт ключ пользователя: старый клиент удаляется
+        на панели 3x-ui (перестаёт работать сразу и необратимо), взамен
+        создаётся новый клиент с новым id и новым subId — то есть выдаётся
+        совсем другой ключ, а не обновление старого."""
+        email = f"user_{user_id}"
+        existing = await self._find_existing_client(email)
+        if existing and existing.get("id"):
+            await self.delete_client(existing["id"])
+        # После удаления create_or_update_user не найдёт старого клиента
+        # и создаст новый — с новым uuid и subId.
+        return await self.create_or_update_user(user_id, expire_timestamp)
+
 vpn_client = VPNClient()
 
 ############################################################
@@ -869,6 +906,12 @@ def back_keyboard():
         [InlineKeyboardButton(text="⬅ Назад", callback_data="profile")]
     ])
 
+def vless_key_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сбросить ключ", callback_data="reset_vless_key")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="profile")]
+    ])
+
 def admin_back_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")]
@@ -1092,12 +1135,11 @@ async def help_command(message: Message):
 @dp.message(Command("about"))
 async def about_command(message: Message):
     await message.answer(
-        "Не успели рассмотреть соглашения? Посмотрите ещё раз!\n\n"
-        "ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ:\n"
-        "https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-09-02-81\n\n"
-        "Условия пользования:\n"
-        "https://telegra.ph/USLOVIYA-POLZOVANIYA-09-02-2\n\n"
-        "👨‍💻 Создатели: @prostokiril, @ll1_coo"
+        '<a href="https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-09-02-81">ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ</a>\n\n'
+        '<a href="https://telegra.ph/USLOVIYA-POLZOVANIYA-09-02-2">УСЛОВИЯ ПОЛЬЗОВАНИЯ</a>\n\n'
+        "👨‍💻 Создатели: @prostokiril, @ll1_coo",
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 ############################################################
@@ -1213,9 +1255,46 @@ async def get_vless_key(callback: CallbackQuery):
         f"🔑 <b>Ваш ключ VLESS для Happ:</b>\n\n"
         f"Скопируйте эту строку и добавьте в приложение Happ:\n\n"
         f"<code>{vless_key}</code>",
-        reply_markup=back_keyboard()
+        reply_markup=vless_key_keyboard()
     )
     await callback.answer()
+
+@dp.callback_query(F.data == "reset_vless_key")
+async def reset_vless_key(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = await asyncio.to_thread(db.get_user, user_id)
+    days = calculate_days(user[3])
+
+    if days <= 0:
+        await callback.answer("❌ Подписка неактивна. Оплатите дни, чтобы получить ключ для Happ.", show_alert=True)
+        return
+
+    await callback.answer("🔄 Обновляем ключ…")
+
+    new_key = ""
+    try:
+        expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+        timestamp = int(expire_dt.timestamp())
+        new_key = await vpn_client.reset_user_key(user_id, timestamp)
+        await asyncio.to_thread(db.conn.execute, "UPDATE users SET vless_key=? WHERE id=?", (new_key, user_id))
+        await asyncio.to_thread(db.conn.commit)
+    except Exception as e:
+        logging.error(f"Ошибка сброса ключа через API: {e}")
+
+    if not new_key:
+        await callback.message.edit_text(
+            "❌ Не удалось сбросить ключ. Попробуйте позже или напишите в поддержку.",
+            reply_markup=vless_key_keyboard()
+        )
+        return
+
+    await callback.message.edit_text(
+        f"🔄 <b>Ключ обновлён!</b>\n\n"
+        f"Старый ключ отключён на сервере и больше не будет работать ни в одном приложении. "
+        f"Обновите ключ в Happ на новый:\n\n"
+        f"<code>{new_key}</code>",
+        reply_markup=vless_key_keyboard()
+    )
 
 ############################################################
 # PAYMENTS
