@@ -303,6 +303,104 @@ class VPNClient:
 vpn_client = VPNClient()
 
 ############################################################
+# PLATEGA.IO API CLIENT (СБП по QR, карты РФ, карточный эквайринг, международная)
+############################################################
+
+# Способы оплаты Platega.io — полный список по официальной схеме API
+# (components/schemas/PaymentMethodInt, docs.platega.io), проверено 04.09.2026.
+# Криптовалюта (paymentMethod=13) исключена по просьбе владельца бота.
+PLATEGA_METHODS = {
+    2:  {"name": "СБП (по QR-коду)",       "emoji": "🏦"},
+    3:  {"name": "ЕРИП",                   "emoji": "🇧🇾"},
+    11: {"name": "Банковская карта",       "emoji": "💳"},
+    12: {"name": "Международная оплата",   "emoji": "🌍"},
+    14: {"name": "SberPay",                "emoji": "🟢"},
+}
+
+class PlategaClient:
+    """Клиент для Platega.io (https://docs.platega.io/) — приём оплаты картой,
+    СБП по QR-коду и международными картами.
+
+    Авторизация — заголовки X-MerchantId / X-Secret на каждый запрос (без
+    отдельного логина, в отличие от 3x-ui)."""
+
+    def __init__(self):
+        self.base_url = os.environ.get("PLATEGA_BASE_URL", "https://app.platega.io").rstrip("/")
+        self.merchant_id = os.environ.get("PLATEGA_MERCHANT_ID", "")
+        self.secret = os.environ.get("PLATEGA_SECRET", "")
+        self._session = None
+
+    def _get_session(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={
+                    "X-MerchantId": self.merchant_id,
+                    "X-Secret": self.secret,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                timeout=aiohttp.ClientTimeout(total=20)
+            )
+        return self._session
+
+    def is_configured(self):
+        return bool(self.merchant_id and self.secret)
+
+    async def create_transaction(self, payment_method: int, amount: float, currency: str,
+                                  description: str = "", payload: str = "", return_url: str = "",
+                                  failed_url: str = ""):
+        """Создаёт транзакцию и возвращает redirect-ссылку на оплату.
+        ID транзакции по документации генерируется системой — id в запросе не передаём.
+        Тело запроса строго по схеме CreateTransactionRequest (additionalProperties: false) —
+        лишних полей (например metadata) быть не должно, иначе Platega вернёт 400."""
+        if not self.is_configured():
+            return None
+        session = self._get_session()
+        body = {
+            "paymentMethod": payment_method,
+            "paymentDetails": {"amount": amount, "currency": currency},
+        }
+        if description:
+            body["description"] = description
+        if payload:
+            body["payload"] = payload
+        if return_url:
+            body["return"] = return_url
+        if failed_url:
+            body["failedUrl"] = failed_url
+        try:
+            async with session.post(f"{self.base_url}/transaction/process", json=body) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    logging.error(f"Platega create_transaction ошибка {resp.status}: {data}")
+                    return None
+                return data
+        except Exception as e:
+            logging.error(f"Platega create_transaction исключение: {e}")
+            return None
+
+    async def get_transaction_status(self, transaction_id: str):
+        if not self.is_configured():
+            return None
+        session = self._get_session()
+        try:
+            async with session.get(f"{self.base_url}/transaction/{transaction_id}") as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    logging.error(f"Platega get_transaction_status ошибка {resp.status}: {data}")
+                    return None
+                return data
+        except Exception as e:
+            logging.error(f"Platega get_transaction_status исключение: {e}")
+            return None
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+platega_client = PlategaClient()
+
+############################################################
 # RATE LIMITER
 ############################################################
 
@@ -596,6 +694,21 @@ class Database:
             PRIMARY KEY (user_id, type)
         )
         """)
+
+        # Транзакции Platega.io (оплата картой/СБП по QR/международная) —
+        # нужна отдельная таблица, чтобы по callback'у или ручной проверке
+        # статуса знать, кому и какой тариф начислять, и не начислить дважды.
+        self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS platega_transactions(
+            transaction_id TEXT PRIMARY KEY,
+            user_id BIGINT,
+            tariff_id TEXT,
+            payment_method INTEGER,
+            amount NUMERIC,
+            status TEXT DEFAULT 'PENDING',
+            created_at TEXT
+        )
+        """)
         
         self.conn.commit()
 
@@ -620,6 +733,22 @@ class Database:
     def get_user(self, user_id):
         cursor = self.conn.execute("SELECT * FROM users WHERE id=?", (user_id,))
         return cursor.fetchone()
+
+    def create_platega_transaction(self, transaction_id, user_id, tariff_id, payment_method, amount):
+        self.conn.execute("""
+            INSERT INTO platega_transactions (transaction_id, user_id, tariff_id, payment_method, amount, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
+            ON CONFLICT (transaction_id) DO NOTHING
+        """, (transaction_id, user_id, tariff_id, payment_method, amount, datetime.now().isoformat()))
+        self.conn.commit()
+
+    def get_platega_transaction(self, transaction_id):
+        cursor = self.conn.execute("SELECT * FROM platega_transactions WHERE transaction_id=?", (transaction_id,))
+        return cursor.fetchone()
+
+    def set_platega_transaction_status(self, transaction_id, status):
+        self.conn.execute("UPDATE platega_transactions SET status=? WHERE transaction_id=?", (status, transaction_id))
+        self.conn.commit()
 
     def get_trial_status(self, user_id):
         """Отдельный запрос ИМЕННО по названиям колонок accepted_terms/trial_used,
@@ -768,6 +897,12 @@ TARIFFS = {
     "year": {"name": "год", "days": 365, "price": 1600, "stars": 1600}
 }
 
+# Служебный тариф для теста оплаты картой из админ-панели — в пользовательских
+# клавиатурах (Stars/Platega) нигде не перечисляется, только по прямой ссылке
+# из admin_keyboard.
+TEST_TARIFF_ID = "admin_test"
+TARIFFS[TEST_TARIFF_ID] = {"name": "тест", "days": 3, "price": 1, "stars": 1}
+
 ############################################################
 # ЮРИДИЧЕСКИЕ ДОКУМЕНТЫ
 ############################################################
@@ -888,17 +1023,18 @@ def stars_payment_keyboard():
     ])
 
 def card_payment_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗓 Месяц — 150₽", callback_data="pay_month")],
-        [InlineKeyboardButton(text="📅 Полгода — 800₽", callback_data="pay_half")],
-        [InlineKeyboardButton(text="📆 Год — 1600₽", callback_data="pay_year")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="payment")]
-    ])
+    buttons = []
+    for method_id, info in PLATEGA_METHODS.items():
+        buttons.append([InlineKeyboardButton(text=f"{info['emoji']} {info['name']}", callback_data=f"platega_method_{method_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅ Назад", callback_data="payment")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def manager_pay_keyboard():
+def platega_tariff_keyboard(method_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✈ Написать менеджеру", url="https://t.me/StopkaPayments_bot")],
-        [InlineKeyboardButton(text="⬅ Назад в меню оплаты", callback_data="pay_type_card")]
+        [InlineKeyboardButton(text=f"🗓 Месяц — {TARIFFS['month']['price']}₽", callback_data=f"platega_tariff_month_{method_id}")],
+        [InlineKeyboardButton(text=f"📅 Полгода — {TARIFFS['half']['price']}₽", callback_data=f"platega_tariff_half_{method_id}")],
+        [InlineKeyboardButton(text=f"📆 Год — {TARIFFS['year']['price']}₽", callback_data=f"platega_tariff_year_{method_id}")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="pay_type_card")]
     ])
 
 def back_keyboard():
@@ -932,8 +1068,16 @@ def admin_keyboard():
         [InlineKeyboardButton(text="🎟 Тикеты", callback_data="admin_tickets")],
         [InlineKeyboardButton(text="🎁 Промокоды", callback_data="promo_admin")],
         [InlineKeyboardButton(text="👑 Назначить/Удалить админа", callback_data="admin_toggle")],
+        [InlineKeyboardButton(text="🧪 Тестовый платёж (1₽ / 3 дня)", callback_data="admin_test_payment")],
         [InlineKeyboardButton(text="⬅ Главное меню", callback_data="profile")]
     ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def admin_test_payment_keyboard():
+    buttons = []
+    for method_id, info in PLATEGA_METHODS.items():
+        buttons.append([InlineKeyboardButton(text=f"{info['emoji']} {info['name']}", callback_data=f"admin_test_method_{method_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def ticket_list_keyboard(tickets):
@@ -1310,8 +1454,11 @@ async def payment_method_select(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "pay_type_card")
 async def payment_card_menu(callback: CallbackQuery):
+    if not platega_client.is_configured():
+        await callback.answer("Оплата картой временно недоступна, попробуйте позже.", show_alert=True)
+        return
     await callback.message.edit_text(
-        "💳 <b>Выберите тарифный план (Оплата картой):</b>\n\n"
+        "💳 <b>Выберите способ оплаты:</b>\n\n"
         "При покупке дни автоматически добавятся к вашей текущей подписке.",
         reply_markup=card_payment_keyboard()
     )
@@ -1326,24 +1473,227 @@ async def payment_stars_menu(callback: CallbackQuery):
     )
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("pay_"))
-async def process_pay(callback: CallbackQuery):
-    tariff_id = callback.data.split("_")[1]
+@dp.callback_query(F.data.startswith("platega_method_"))
+async def platega_method_select(callback: CallbackQuery):
+    method_id = int(callback.data.split("_")[2])
+    method = PLATEGA_METHODS.get(method_id)
+    if not method:
+        await callback.answer("Способ оплаты недоступен", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"{method['emoji']} <b>{method['name']}</b>\n\n"
+        f"Выберите тарифный план:",
+        reply_markup=platega_tariff_keyboard(method_id)
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("platega_tariff_"))
+async def process_platega_pay(callback: CallbackQuery):
+    # формат: platega_tariff_{tariff_id}_{method_id}
+    parts = callback.data.split("_")
+    tariff_id, method_id = parts[2], int(parts[3])
     tariff = TARIFFS.get(tariff_id)
-    if not tariff:
+    method = PLATEGA_METHODS.get(method_id)
+    if not tariff or not method:
         await callback.answer("Ошибка выбора тарифа", show_alert=True)
         return
 
-    msg_to_copy = f"Здравствуйте! Я по поводу оплаты {tariff['name']} за {tariff['price']} ₽"
+    if not platega_client.is_configured():
+        await callback.answer("Оплата картой временно недоступна, попробуйте позже.", show_alert=True)
+        return
 
+    await callback.answer("Создаём ссылку на оплату…")
+
+    user = callback.from_user
+    bot_username = BOT_USERNAME or (await bot.get_me()).username
+    return_url = f"https://t.me/{bot_username}?start=pay_success"
+    failed_url = f"https://t.me/{bot_username}?start=pay_failed"
+
+    result = await platega_client.create_transaction(
+        payment_method=method_id,
+        amount=tariff["price"],
+        currency="RUB",
+        description=f"Подписка Stopka VPN ({tariff['name']})",
+        payload=f"platega_{tariff_id}_{user.id}_{int(time.time())}",
+        return_url=return_url,
+        failed_url=failed_url
+    )
+
+    pay_url = result.get("url") or result.get("redirect") if result else None
+    transaction_id = result.get("transactionId") if result else None
+
+    if not result or not pay_url or not transaction_id:
+        await callback.message.edit_text(
+            "❌ Не удалось создать платёж. Попробуйте другой способ оплаты или напишите в поддержку.",
+            reply_markup=card_payment_keyboard()
+        )
+        return
+
+    await asyncio.to_thread(
+        db.create_platega_transaction, transaction_id, user.id, tariff_id, method_id, tariff["price"]
+    )
+
+    expires_in = result.get("expiresIn", "00:15:00")
+    pay_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="pay_type_card")]
+    ])
     await callback.message.edit_text(
-        f"💳 <b>Оплата тарифного плана</b>\n\n"
-        f"Для оплаты напишите менеджеру в @StopkaPayments_bot.\n\n"
-        f"📌 <b>Напишите ему это сообщение:</b>\n"
-        f"<code>{msg_to_copy}</code>",
-        reply_markup=manager_pay_keyboard()
+        f"{method['emoji']} <b>{method['name']} — {tariff['name']}, {tariff['price']}₽</b>\n\n"
+        f"Ссылка на оплату действительна {expires_in}. После оплаты подписка продлится автоматически — "
+        f"ничего дополнительно присылать не нужно.",
+        reply_markup=pay_kb
+    )
+
+@dp.callback_query(F.data == "admin_test_payment")
+async def admin_test_payment_menu(callback: CallbackQuery):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
+        await callback.answer("❌ Нет доступа. Вы не администратор!", show_alert=True)
+        return
+    if not platega_client.is_configured():
+        await callback.answer("Platega не настроена (нет PLATEGA_MERCHANT_ID/PLATEGA_SECRET).", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🧪 <b>Тестовый платёж</b>\n\n"
+        "1₽ → +3 дня подписки. Выберите способ оплаты для проверки:",
+        reply_markup=admin_test_payment_keyboard()
     )
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_test_method_"))
+async def admin_test_pay_create(callback: CallbackQuery):
+    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
+        await callback.answer("❌ Нет доступа. Вы не администратор!", show_alert=True)
+        return
+
+    method_id = int(callback.data.split("_")[3])
+    method = PLATEGA_METHODS.get(method_id)
+    tariff = TARIFFS[TEST_TARIFF_ID]
+    if not method:
+        await callback.answer("Способ оплаты недоступен", show_alert=True)
+        return
+
+    if not platega_client.is_configured():
+        await callback.answer("Platega не настроена.", show_alert=True)
+        return
+
+    await callback.answer("Создаём тестовый платёж…")
+
+    user = callback.from_user
+    bot_username = BOT_USERNAME or (await bot.get_me()).username
+    return_url = f"https://t.me/{bot_username}?start=pay_success"
+    failed_url = f"https://t.me/{bot_username}?start=pay_failed"
+
+    result = await platega_client.create_transaction(
+        payment_method=method_id,
+        amount=tariff["price"],
+        currency="RUB",
+        description="Тестовый платёж (админ, 1₽ / 3 дня)",
+        payload=f"platega_{TEST_TARIFF_ID}_{user.id}_{int(time.time())}",
+        return_url=return_url,
+        failed_url=failed_url
+    )
+
+    pay_url = result.get("redirect") or result.get("url") if result else None
+    transaction_id = result.get("transactionId") if result else None
+
+    if not result or not pay_url or not transaction_id:
+        await callback.message.edit_text(
+            "❌ Не удалось создать тестовый платёж. Проверьте PLATEGA_MERCHANT_ID/PLATEGA_SECRET и попробуйте другой способ.",
+            reply_markup=admin_test_payment_keyboard()
+        )
+        return
+
+    await asyncio.to_thread(
+        db.create_platega_transaction, transaction_id, user.id, TEST_TARIFF_ID, method_id, tariff["price"]
+    )
+
+    expires_in = result.get("expiresIn", "00:15:00")
+    pay_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="admin_test_payment")]
+    ])
+    await callback.message.edit_text(
+        f"🧪 <b>Тестовый платёж — {method['emoji']} {method['name']}, {tariff['price']}₽ → +{tariff['days']} дня</b>\n\n"
+        f"Ссылка действительна {expires_in}. После оплаты придёт то же уведомление, что и обычному "
+        f"пользователю, и в базе появится тестовая транзакция.",
+        reply_markup=pay_kb
+    )
+
+async def activate_subscription(user_id: int, tariff_id: str):
+    """Продлевает подписку пользователю на days тарифа tariff_id, обновляет
+    ключ на 3x-ui, начисляет реферальный бонус пригласившему (один раз, при
+    первой реальной оплате). Используется и для Stars, и для Platega.
+    Возвращает (days, new_expire_str) или None, если тариф/пользователь не найден."""
+    tariff = TARIFFS.get(tariff_id)
+    if not tariff:
+        return None
+    days = tariff["days"]
+    user = await asyncio.to_thread(db.get_user, user_id)
+    if not user:
+        return None
+
+    try:
+        expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        expire = datetime.now()
+
+    now = datetime.now()
+    if expire < now:
+        expire = now
+
+    new_expire = expire + timedelta(days=days)
+    new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
+
+    await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно', last_tariff=? WHERE id=?", (new_expire_str, tariff['name'], user_id))
+    await asyncio.to_thread(db.conn.commit)
+
+    try:
+        await vpn_client.create_or_update_user(user_id, int(new_expire.timestamp()))
+    except Exception:
+        pass
+
+    # Реферальный бонус — начисляется один раз, в момент ПЕРВОЙ реальной
+    # оплаты приглашённого (а не за сам факт перехода по ссылке — так
+    # бонус не накрутить фейковыми регистрациями без покупки).
+    if not user[7]:  # first_payment ещё не было
+        await asyncio.to_thread(db.conn.execute, "UPDATE users SET first_payment=1 WHERE id=?", (user_id,))
+        await asyncio.to_thread(db.conn.commit)
+
+        inviter_id = user[6]  # invited_by
+        if inviter_id:
+            row = (await asyncio.to_thread(
+                db.conn.execute, "SELECT bonus_given FROM referrals WHERE user_id=?", (user_id,)
+            )).fetchone()
+            if row and row[0] == 0:
+                inviter = await asyncio.to_thread(db.get_user, inviter_id)
+                if inviter:
+                    try:
+                        inv_expire = datetime.strptime(inviter[3], "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        inv_expire = datetime.now()
+                    if inv_expire < datetime.now():
+                        inv_expire = datetime.now()
+                    inv_new_expire = inv_expire + timedelta(days=REFERRAL_DAYS)
+                    inv_new_expire_str = inv_new_expire.strftime("%Y-%m-%d 23:59:59")
+
+                    await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (inv_new_expire_str, inviter_id))
+                    await asyncio.to_thread(db.conn.execute, "UPDATE referrals SET bonus_given=1 WHERE user_id=?", (user_id,))
+                    await asyncio.to_thread(db.conn.commit)
+
+                    try:
+                        await vpn_client.create_or_update_user(inviter_id, int(inv_new_expire.timestamp()))
+                    except Exception:
+                        pass
+                    try:
+                        await bot.send_message(
+                            inviter_id,
+                            f"🎁 Ваш друг оформил подписку по вашей ссылке!\nВам начислено +{REFERRAL_DAYS} дней VPN."
+                        )
+                    except Exception:
+                        pass
+
+    return days, new_expire_str
 
 @dp.callback_query(F.data.startswith("stars_"))
 async def process_stars_pay(callback: CallbackQuery):
@@ -1378,77 +1728,15 @@ async def process_successful_payment(message: Message):
     if payload.startswith("stars_"):
         parts = payload.split("_")
         tariff_id = parts[1]
-        tariff = TARIFFS.get(tariff_id)
-        if tariff:
-            days = tariff["days"]
-            user = await asyncio.to_thread(db.get_user, user_id)
-            if user:
-                try:
-                    expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
-                except:
-                    expire = datetime.now()
-                
-                now = datetime.now()
-                if expire < now:
-                    expire = now
-                
-                new_expire = expire + timedelta(days=days)
-                new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
-                
-                await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно', last_tariff=? WHERE id=?", (new_expire_str, tariff['name'], user_id))
-                await asyncio.to_thread(db.conn.commit)
-
-                try:
-                    await vpn_client.create_or_update_user(user_id, int(new_expire.timestamp()))
-                except:
-                    pass
-
-                # Реферальный бонус — начисляется один раз, в момент ПЕРВОЙ реальной
-                # оплаты приглашённого (а не за сам факт перехода по ссылке — так
-                # бонус не накрутить фейковыми регистрациями без покупки).
-                if not user[7]:  # first_payment ещё не было
-                    await asyncio.to_thread(db.conn.execute, "UPDATE users SET first_payment=1 WHERE id=?", (user_id,))
-                    await asyncio.to_thread(db.conn.commit)
-
-                    inviter_id = user[6]  # invited_by
-                    if inviter_id:
-                        row = (await asyncio.to_thread(
-                            db.conn.execute, "SELECT bonus_given FROM referrals WHERE user_id=?", (user_id,)
-                        )).fetchone()
-                        if row and row[0] == 0:
-                            inviter = await asyncio.to_thread(db.get_user, inviter_id)
-                            if inviter:
-                                try:
-                                    inv_expire = datetime.strptime(inviter[3], "%Y-%m-%d %H:%M:%S")
-                                except:
-                                    inv_expire = datetime.now()
-                                if inv_expire < datetime.now():
-                                    inv_expire = datetime.now()
-                                inv_new_expire = inv_expire + timedelta(days=REFERRAL_DAYS)
-                                inv_new_expire_str = inv_new_expire.strftime("%Y-%m-%d 23:59:59")
-
-                                await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (inv_new_expire_str, inviter_id))
-                                await asyncio.to_thread(db.conn.execute, "UPDATE referrals SET bonus_given=1 WHERE user_id=?", (user_id,))
-                                await asyncio.to_thread(db.conn.commit)
-
-                                try:
-                                    await vpn_client.create_or_update_user(inviter_id, int(inv_new_expire.timestamp()))
-                                except:
-                                    pass
-                                try:
-                                    await bot.send_message(
-                                        inviter_id,
-                                        f"🎁 Ваш друг оформил подписку по вашей ссылке!\nВам начислено +{REFERRAL_DAYS} дней VPN."
-                                    )
-                                except:
-                                    pass
-
-                await message.answer(
-                    f"🎉 <b>Оплата прошла успешно!</b>\n\n"
-                    f"Вам добавлено <b>+{days} дней</b> подписки.\n"
-                    f"Подписка активна до: <b>{new_expire_str}</b>",
-                    reply_markup=back_keyboard()
-                )
+        result = await activate_subscription(user_id, tariff_id)
+        if result:
+            days, new_expire_str = result
+            await message.answer(
+                f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+                f"Вам добавлено <b>+{days} дней</b> подписки.\n"
+                f"Подписка активна до: <b>{new_expire_str}</b>",
+                reply_markup=back_keyboard()
+            )
 
 ############################################################
 # REFERRAL & PROMO
@@ -2088,10 +2376,72 @@ async def error_handler(event: ErrorEvent):
 async def handle_ping(request):
     return web.Response(text="Bot is running", status=200)
 
+async def handle_platega_callback(request):
+    # Callback от Platega.io: подтверждаем подлинность заголовками
+    # X-MerchantId/X-Secret (их присылает сам Platega — сверяем с нашими же
+    # ключами), затем по статусу CONFIRMED начисляем подписку.
+    # На отсутствие ответа за 60 секунд Platega делает до 3 повторов, поэтому
+    # отвечаем максимально быстро и идемпотентно (по статусу транзакции в БД).
+    try:
+        merchant_header = request.headers.get("X-MerchantId", "")
+        secret_header = request.headers.get("X-Secret", "")
+        if (not platega_client.is_configured()
+                or merchant_header != platega_client.merchant_id
+                or secret_header != platega_client.secret):
+            logging.warning("Platega callback: неверные X-MerchantId/X-Secret")
+            return web.Response(status=401, text="unauthorized")
+
+        data = await request.json()
+    except Exception as e:
+        logging.error(f"Platega callback: не удалось разобрать тело запроса: {e}")
+        return web.Response(status=400, text="bad request")
+
+    transaction_id = data.get("id")
+    status = data.get("status")
+    if not transaction_id or not status:
+        return web.Response(status=400, text="missing id/status")
+
+    tx = await asyncio.to_thread(db.get_platega_transaction, transaction_id)
+    if not tx:
+        logging.warning(f"Platega callback: неизвестная транзакция {transaction_id}")
+        return web.Response(status=200, text="ok")  # 200, чтобы Platega не долбила ретраями
+
+    tx_user_id, tx_tariff_id, tx_status = tx[1], tx[2], tx[5]
+
+    if tx_status != "PENDING":
+        # Уже обработали раньше (в т.ч. повторный callback) — просто подтверждаем приём.
+        return web.Response(status=200, text="ok")
+
+    await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, status)
+
+    if status == "CONFIRMED":
+        result = await activate_subscription(tx_user_id, tx_tariff_id)
+        if result:
+            days, new_expire_str = result
+            try:
+                await bot.send_message(
+                    tx_user_id,
+                    f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+                    f"Вам добавлено <b>+{days} дней</b> подписки.\n"
+                    f"Подписка активна до: <b>{new_expire_str}</b>",
+                    reply_markup=back_keyboard()
+                )
+            except Exception:
+                pass
+    elif status == "CANCELED":
+        try:
+            await bot.send_message(tx_user_id, "❌ Платёж не прошёл или был отменён. Попробуйте оплатить ещё раз.")
+        except Exception:
+            pass
+    # CHARGEBACKED — просто фиксируем статус в БД, доступ не трогаем автоматически.
+
+    return web.Response(status=200, text="ok")
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
     app.router.add_get('/ping', handle_ping)
+    app.router.add_post('/platega/webhook', handle_platega_callback)
     
     runner = web.AppRunner(app)
     await runner.setup()
