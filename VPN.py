@@ -309,12 +309,10 @@ vpn_client = VPNClient()
 # Способы оплаты Platega.io — полный список по официальной схеме API
 # (components/schemas/PaymentMethodInt, docs.platega.io), проверено 04.09.2026.
 # Криптовалюта (paymentMethod=13) исключена по просьбе владельца бота.
+# ЕРИП, SberPay и международная оплата тоже отключены — не предусмотрены у мерчанта.
 PLATEGA_METHODS = {
     2:  {"name": "СБП (по QR-коду)",       "emoji": "🏦"},
-    3:  {"name": "ЕРИП",                   "emoji": "🇧🇾"},
     11: {"name": "Банковская карта",       "emoji": "💳"},
-    12: {"name": "Международная оплата",   "emoji": "🌍"},
-    14: {"name": "SberPay",                "emoji": "🟢"},
 }
 
 class PlategaClient:
@@ -745,6 +743,18 @@ class Database:
     def get_platega_transaction(self, transaction_id):
         cursor = self.conn.execute("SELECT * FROM platega_transactions WHERE transaction_id=?", (transaction_id,))
         return cursor.fetchone()
+
+    def claim_platega_transaction(self, transaction_id, new_status):
+        """Атомарно переводит транзакцию из PENDING в new_status и говорит,
+        удалось ли именно ЭТОМУ вызову совершить переход. Нужно, чтобы
+        вебхук и ручная кнопка «Проверить оплату» не могли начислить дни
+        дважды, если сработают почти одновременно."""
+        cursor = self.conn.execute(
+            "UPDATE platega_transactions SET status=? WHERE transaction_id=? AND status='PENDING'",
+            (new_status, transaction_id)
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
 
     def set_platega_transaction_status(self, transaction_id, status):
         self.conn.execute("UPDATE platega_transactions SET status=? WHERE transaction_id=?", (status, transaction_id))
@@ -1536,14 +1546,76 @@ async def process_platega_pay(callback: CallbackQuery):
     expires_in = result.get("expiresIn", "00:15:00")
     pay_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"platega_check_{transaction_id}")],
         [InlineKeyboardButton(text="⬅ Назад", callback_data="pay_type_card")]
     ])
     await callback.message.edit_text(
         f"{method['emoji']} <b>{method['name']} — {tariff['name']}, {tariff['price']}₽</b>\n\n"
-        f"Ссылка на оплату действительна {expires_in}. После оплаты подписка продлится автоматически — "
-        f"ничего дополнительно присылать не нужно.",
+        f"Ссылка на оплату действительна {expires_in}.\n\n"
+        f"❗️ После того как оплатите — обязательно нажмите «🔄 Проверить оплату», "
+        f"иначе подписка может не продлиться вовремя.",
         reply_markup=pay_kb
     )
+
+@dp.callback_query(F.data.startswith("platega_check_"))
+async def platega_check_payment(callback: CallbackQuery):
+    transaction_id = callback.data[len("platega_check_"):]
+
+    tx = await asyncio.to_thread(db.get_platega_transaction, transaction_id)
+    if not tx:
+        await callback.answer("Транзакция не найдена.", show_alert=True)
+        return
+
+    tx_user_id, tx_tariff_id, tx_status = tx[1], tx[2], tx[5]
+
+    if tx_status == "CONFIRMED":
+        # Уже начислено раньше (вебхуком или предыдущей проверкой) — просто подтверждаем.
+        await callback.answer("✅ Эта оплата уже подтверждена, дни начислены.", show_alert=True)
+        return
+
+    if tx_status == "CANCELED":
+        await callback.answer("❌ Этот платёж был отменён. Создайте новый.", show_alert=True)
+        return
+
+    # Спрашиваем реальный статус напрямую у Platega, а не полагаемся только на вебхук
+    result = await platega_client.get_transaction_status(transaction_id)
+    if result is None:
+        await callback.answer("Не удалось связаться с платёжной системой. Попробуйте ещё раз через минуту.", show_alert=True)
+        return
+
+    live_status = result.get("status")
+
+    if live_status == "CONFIRMED":
+        if not await asyncio.to_thread(db.claim_platega_transaction, transaction_id, live_status):
+            # Кто-то (например, вебхук) успел начислить за это время — не начисляем повторно.
+            await callback.answer("✅ Оплата уже подтверждена, дни начислены.", show_alert=True)
+            return
+
+        activation = await activate_subscription(tx_user_id, tx_tariff_id)
+        if activation:
+            days, new_expire_str = activation
+            await callback.answer("🎉 Оплата подтверждена!", show_alert=True)
+            try:
+                await callback.message.edit_text(
+                    f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+                    f"Вам добавлено <b>+{days} дней</b> подписки.\n"
+                    f"Подписка активна до: <b>{new_expire_str}</b>",
+                    reply_markup=back_keyboard()
+                )
+            except Exception:
+                pass
+        else:
+            await callback.answer("Оплата подтверждена, но не удалось начислить дни — напишите в поддержку.", show_alert=True)
+    elif live_status == "CANCELED":
+        await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, live_status)
+        await callback.answer("❌ Платёж не прошёл или был отменён. Попробуйте оплатить ещё раз.", show_alert=True)
+    else:
+        # Всё ещё PENDING (или статус, которого мы не знаем) — платёж мог просто не успеть обработаться.
+        await callback.answer(
+            "⏳ Если вы оплатили — подождите немного, возможно платёж ещё не прошёл. "
+            "Попробуйте проверить ещё раз через минуту.",
+            show_alert=True
+        )
 
 @dp.callback_query(F.data == "admin_test_payment")
 async def admin_test_payment_menu(callback: CallbackQuery):
@@ -1611,12 +1683,13 @@ async def admin_test_pay_create(callback: CallbackQuery):
     expires_in = result.get("expiresIn", "00:15:00")
     pay_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url)],
+        [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"platega_check_{transaction_id}")],
         [InlineKeyboardButton(text="⬅ Назад", callback_data="admin_test_payment")]
     ])
     await callback.message.edit_text(
         f"🧪 <b>Тестовый платёж — {method['emoji']} {method['name']}, {tariff['price']}₽ → +{tariff['days']} дня</b>\n\n"
-        f"Ссылка действительна {expires_in}. После оплаты придёт то же уведомление, что и обычному "
-        f"пользователю, и в базе появится тестовая транзакция.",
+        f"Ссылка действительна {expires_in}. После оплаты нажмите «🔄 Проверить оплату» — "
+        f"в базе появится тестовая транзакция и придёт то же уведомление, что и обычному пользователю.",
         reply_markup=pay_kb
     )
 
@@ -2412,9 +2485,11 @@ async def handle_platega_callback(request):
         # Уже обработали раньше (в т.ч. повторный callback) — просто подтверждаем приём.
         return web.Response(status=200, text="ok")
 
-    await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, status)
-
     if status == "CONFIRMED":
+        if not await asyncio.to_thread(db.claim_platega_transaction, transaction_id, status):
+            # Кто-то другой (например, ручная проверка от пользователя) уже
+            # обработал эту транзакцию за это время — не начисляем повторно.
+            return web.Response(status=200, text="ok")
         result = await activate_subscription(tx_user_id, tx_tariff_id)
         if result:
             days, new_expire_str = result
@@ -2428,11 +2503,13 @@ async def handle_platega_callback(request):
                 )
             except Exception:
                 pass
-    elif status == "CANCELED":
-        try:
-            await bot.send_message(tx_user_id, "❌ Платёж не прошёл или был отменён. Попробуйте оплатить ещё раз.")
-        except Exception:
-            pass
+    else:
+        await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, status)
+        if status == "CANCELED":
+            try:
+                await bot.send_message(tx_user_id, "❌ Платёж не прошёл или был отменён. Попробуйте оплатить ещё раз.")
+            except Exception:
+                pass
     # CHARGEBACKED — просто фиксируем статус в БД, доступ не трогаем автоматически.
 
     return web.Response(status=200, text="ok")
