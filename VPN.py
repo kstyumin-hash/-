@@ -309,12 +309,13 @@ vpn_client = VPNClient()
 # Способы оплаты Platega.io — полный список по официальной схеме API
 # (components/schemas/PaymentMethodInt, docs.platega.io), проверено 04.09.2026.
 # Криптовалюта (paymentMethod=13) исключена по просьбе владельца бота.
+# Способы оплаты Platega.io — полный список по официальной схеме API
+# (components/schemas/PaymentMethodInt, docs.platega.io), проверено 04.09.2026.
+# Криптовалюта (paymentMethod=13) исключена по просьбе владельца бота.
+# ЕРИП, SberPay и международная оплата тоже отключены — не предусмотрены у мерчанта.
 PLATEGA_METHODS = {
     2:  {"name": "СБП (по QR-коду)",       "emoji": "🏦"},
-    3:  {"name": "ЕРИП",                   "emoji": "🇧🇾"},
     11: {"name": "Банковская карта",       "emoji": "💳"},
-    12: {"name": "Международная оплата",   "emoji": "🌍"},
-    14: {"name": "SberPay",                "emoji": "🟢"},
 }
 
 class PlategaClient:
@@ -355,10 +356,9 @@ class PlategaClient:
         лишних полей (например metadata) быть не должно, иначе Platega вернёт 400.
 
         Используем /v2/transaction/process, а не старый /transaction/process:
-        старый эндпоинт для карт (paymentMethod=11) отдаёт 400 "No available
-        card cascades" — у мерчантов больше нет настроенных карточных
-        каскадов на v1. СБП (paymentMethod=2) на v1 ещё работал, но карты — нет.
-        v2 на том же хосте поддерживает оба способа."""
+        по независимым сообщениям других разработчиков, у части мерчантов на
+        v1 нет каскадов для карточных платежей (paymentMethod=11), из-за чего
+        приходит "No available card cascades". СБП на v1 обычно ещё работает."""
         if not self.is_configured():
             return None
         session = self._get_session()
