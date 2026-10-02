@@ -1061,6 +1061,16 @@ def platega_tariff_keyboard(method_id: int):
         [back_btn("payment")]
     ])
 
+PAY_FAILED_TEXT = (
+    "❌ <b>Платёж отменён или не оплачен</b>\n\n"
+    "Деньги не списаны, подписка не изменилась. Вы можете попробовать ещё раз."
+)
+
+def pay_failed_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("💳 Посмотреть тарифы", callback_data="payment", style="success")]
+    ])
+
 def back_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅ Назад", callback_data="profile", style="danger")]
@@ -1259,6 +1269,11 @@ async def start(message: Message):
                             await asyncio.to_thread(db.conn.commit)
                 except Exception as e:
                     logging.error(f"Ошибка обработки реферала: {e}")
+
+        # Возврат из Platega после отмены/неуспешной оплаты (failedUrl)
+        if len(args) > 1 and args[1] == "pay_failed":
+            await message.answer(PAY_FAILED_TEXT, reply_markup=pay_failed_keyboard())
+            return
 
         # Показываем приветственный экран, только если пробный период ЕЩЁ НИ РАЗУ
         # не выдавался этому пользователю. Раньше здесь была проверка вида "или
@@ -2525,7 +2540,7 @@ async def handle_platega_callback(request):
         claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "PENDING", "CANCELED")
         if claimed:
             try:
-                await bot.send_message(claimed[0], "❌ Платёж не прошёл или был отменён. Попробуйте оплатить ещё раз.")
+                await bot.send_message(claimed[0], PAY_FAILED_TEXT, reply_markup=pay_failed_keyboard())
             except Exception:
                 pass
 
