@@ -764,6 +764,14 @@ class Database:
         )
         return cur.fetchone()
 
+    def get_pending_platega_ids(self, since_iso):
+        """ID транзакций Platega в статусе PENDING, созданных не раньше since_iso."""
+        cur = self.conn.execute(
+            "SELECT transaction_id FROM platega_transactions WHERE status='PENDING' AND created_at >= ?",
+            (since_iso,)
+        )
+        return [r[0] for r in cur.fetchall()]
+
     def get_platega_transaction(self, transaction_id):
         cursor = self.conn.execute("SELECT * FROM platega_transactions WHERE transaction_id=?", (transaction_id,))
         return cursor.fetchone()
@@ -1269,11 +1277,6 @@ async def start(message: Message):
                             await asyncio.to_thread(db.conn.commit)
                 except Exception as e:
                     logging.error(f"Ошибка обработки реферала: {e}")
-
-        # Возврат из Platega после отмены/неуспешной оплаты (failedUrl)
-        if len(args) > 1 and args[1] == "pay_failed":
-            await message.answer(PAY_FAILED_TEXT, reply_markup=pay_failed_keyboard())
-            return
 
         # Показываем приветственный экран, только если пробный период ЕЩЁ НИ РАЗУ
         # не выдавался этому пользователю. Раньше здесь была проверка вида "или
@@ -2371,6 +2374,35 @@ async def subscription_checker():
 
 LOGS_RETENTION_DAYS = 7              # admin_logs и notifications старше — удаляются
 CLOSED_TICKETS_RETENTION_DAYS = 30   # закрытые тикеты (текст, ответ, file_id) старше — удаляются; открытые не трогаем
+PLATEGA_POLL_INTERVAL = 15           # как часто бот спрашивает Platega о статусе, сек
+PLATEGA_POLL_WINDOW_MIN = 60         # проверяем только свежие неоплаченные транзакции, мин
+
+async def platega_status_checker():
+    """Сам опрашивает Platega по неоплаченным транзакциям. Если Platega сообщает, что
+    платёж отменён — автоматически, независимо от действий пользователя и от callback'а,
+    отправляет ему сообщение с кнопкой «Посмотреть тарифы». Переход PENDING -> CANCELED
+    атомарный, поэтому вместе с callback'ом сообщение уйдёт ровно один раз."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            if platega_client.is_configured():
+                since = (datetime.now() - timedelta(minutes=PLATEGA_POLL_WINDOW_MIN)).isoformat()
+                tx_ids = await asyncio.to_thread(db.get_pending_platega_ids, since)
+                for tx_id in tx_ids:
+                    data = await platega_client.get_transaction_status(tx_id)
+                    status = str(data.get("status", "")).upper() if isinstance(data, dict) else ""
+                    if status == "CANCELED":
+                        claimed = await asyncio.to_thread(db.claim_platega_transaction, tx_id, "PENDING", "CANCELED")
+                        if claimed:
+                            try:
+                                await bot.send_message(claimed[0], PAY_FAILED_TEXT, reply_markup=pay_failed_keyboard())
+                            except Exception as e:
+                                logging.warning(f"Platega: не удалось отправить сообщение об отмене {claimed[0]}: {e}")
+                    await asyncio.sleep(0.3)
+        except Exception as e:
+            logging.error(f"Ошибка platega_status_checker: {e}")
+        await asyncio.sleep(PLATEGA_POLL_INTERVAL)
+
 PLATEGA_DEAD_RETENTION_DAYS = 7      # отменённые/зависшие транзакции Platega
 PLATEGA_DONE_RETENTION_DAYS = 180    # оплаченные транзакции — храним для учёта полгода
 STARS_RETENTION_DAYS = 180
@@ -2587,6 +2619,7 @@ async def main():
 
     asyncio.create_task(subscription_checker())
     asyncio.create_task(db_cleanup_task())
+    asyncio.create_task(platega_status_checker())
 
     logging.info("✅ Stopka VPN запущен успешно!")
     try:
