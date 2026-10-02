@@ -314,6 +314,9 @@ PLATEGA_METHODS = {
     11: {"name": "Банковская карта",       "emoji": "💳"},
 }
 
+PLATEGA_CREATE_TIMEOUT = 8      # сек на одну попытку создания платежа
+PLATEGA_CREATE_ATTEMPTS = 3     # сколько всего попыток при временных сбоях
+
 class PlategaClient:
     """Клиент для Platega.io (https://docs.platega.io/) — приём оплаты картой,
     СБП по QR-коду и международными картами.
@@ -336,7 +339,8 @@ class PlategaClient:
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 },
-                timeout=aiohttp.ClientTimeout(total=20)
+                timeout=aiohttp.ClientTimeout(total=20),
+                connector=aiohttp.TCPConnector(ttl_dns_cache=300, limit=20)
             )
         return self._session
 
@@ -370,16 +374,36 @@ class PlategaClient:
             body["return"] = return_url
         if failed_url:
             body["failedUrl"] = failed_url
-        try:
-            async with session.post(f"{self.base_url}/v2/transaction/process", json=body) as resp:
-                data = await resp.json()
-                if resp.status != 200:
-                    logging.error(f"Platega create_transaction ошибка {resp.status}: {data}")
-                    return None
-                return data
-        except Exception as e:
-            logging.error(f"Platega create_transaction исключение: {e}")
-            return None
+        # Короткий таймаут на попытку + повторы при временных сбоях (обрыв соединения,
+        # таймаут, 5xx, 429) вместо одного долгого ожидания на 20 секунд. Повтор безопасен:
+        # неоплаченная «лишняя» транзакция в Platega никому не начисляется — бот начисляет
+        # только по той, чей id сохранил в своей БД. Ошибки 4xx (неверный запрос) не повторяем.
+        url = f"{self.base_url}/v2/transaction/process"
+        timeout = aiohttp.ClientTimeout(total=PLATEGA_CREATE_TIMEOUT, connect=5)
+        for attempt in range(1, PLATEGA_CREATE_ATTEMPTS + 1):
+            started = time.monotonic()
+            try:
+                async with session.post(url, json=body, timeout=timeout) as resp:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        data = None
+                    elapsed = time.monotonic() - started
+                    if resp.status == 200 and isinstance(data, dict):
+                        logging.info(f"Platega create_transaction OK за {elapsed:.1f}с (попытка {attempt})")
+                        return data
+                    logging.error(f"Platega create_transaction ошибка {resp.status} за {elapsed:.1f}с (попытка {attempt}): {data}")
+                    # 200 с неразборчивым телом, 5xx, 408, 429 — временные, остальное — нет
+                    if not (resp.status == 200 or resp.status >= 500 or resp.status in (408, 429)):
+                        return None
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logging.warning(f"Platega create_transaction сбой соединения за {time.monotonic() - started:.1f}с (попытка {attempt}): {e!r}")
+            except Exception as e:
+                logging.error(f"Platega create_transaction исключение: {e!r}")
+                return None
+            if attempt < PLATEGA_CREATE_ATTEMPTS:
+                await asyncio.sleep(0.5 * attempt)
+        return None
 
     async def get_transaction_status(self, transaction_id: str):
         if not self.is_configured():
@@ -1540,7 +1564,15 @@ async def process_platega_pay(callback: CallbackQuery):
         await callback.answer("⏳ Секунду, ссылка уже создаётся…")
         return
 
-    await callback.answer("Создаём ссылку на оплату…")
+    # Обратная связь уходит ПАРАЛЛЕЛЬНО с запросом в Platega (а не перед ним), а кнопки
+    # тарифов на время создания убираются — повторные нажатия не плодят лишние платежи.
+    async def _show_progress():
+        try:
+            await callback.answer("Создаём ссылку на оплату…")
+            await callback.message.edit_text("⏳ <b>Создаём ссылку на оплату…</b>")
+        except Exception:
+            pass
+    progress_task = asyncio.create_task(_show_progress())
 
     user = callback.from_user
     bot_username = BOT_USERNAME or (await bot.get_me()).username
@@ -1556,6 +1588,8 @@ async def process_platega_pay(callback: CallbackQuery):
         return_url=return_url,
         failed_url=failed_url
     )
+
+    await progress_task  # чтобы «Создаём ссылку…» не перезаписало итоговое сообщение
 
     pay_url = (result.get("redirect") or result.get("url")) if result else None
     transaction_id = result.get("transactionId") if result else None
