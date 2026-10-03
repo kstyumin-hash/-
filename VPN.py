@@ -1196,21 +1196,21 @@ def admin_back_keyboard():
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")]
     ])
 
-def support_keyboard():
+def support_keyboard(style=None):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📨 Написать в поддержку", callback_data="create_ticket")]
+        [btn("📨 Написать в поддержку", callback_data="create_ticket", style=style)]
     ])
 
 def admin_keyboard():
     buttons = [
-        [InlineKeyboardButton(text="👤 Просмотр профиля", callback_data="admin_view_profile")],
-        [InlineKeyboardButton(text="🚫 Отключить подписку", callback_data="admin_disable")],
-        [InlineKeyboardButton(text="📅 Выдать дни подписки", callback_data="admin_give")],
-        [InlineKeyboardButton(text="👥 Статистика пользователей", callback_data="users_count")],
-        [InlineKeyboardButton(text="📢 Рассылка", callback_data="broadcast")],
-        [InlineKeyboardButton(text="🎟 Тикеты", callback_data="admin_tickets")],
-        [InlineKeyboardButton(text="🎁 Промокоды", callback_data="promo_admin")],
-        [InlineKeyboardButton(text="👑 Назначить/Удалить админа", callback_data="admin_toggle")],
+        [btn("👤 Просмотр профиля", callback_data="admin_view_profile", style="success")],
+        [btn("🚫 Отключить подписку", callback_data="admin_disable", style="success")],
+        [btn("📅 Выдать дни подписки", callback_data="admin_give", style="success")],
+        [btn("👥 Статистика пользователей", callback_data="users_count", style="success")],
+        [btn("📢 Рассылка", callback_data="broadcast", style="success")],
+        [btn("🎟 Тикеты", callback_data="admin_tickets", style="success")],
+        [btn("🎁 Промокоды", callback_data="promo_admin", style="success")],
+        [btn("👑 Назначить/Удалить админа", callback_data="admin_toggle", style="success")],
         [InlineKeyboardButton(text="⬅ Главное меню", callback_data="profile", style="danger")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1233,9 +1233,9 @@ def ticket_list_keyboard(tickets):
 
 def promo_admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Создать промокод", callback_data="promo_create")],
-        [InlineKeyboardButton(text="📋 Список промокодов", callback_data="promo_list")],
-        [InlineKeyboardButton(text="🗑 Очистить использованные", callback_data="promo_clear_confirm")],
+        [btn("➕ Создать промокод", callback_data="promo_create", style="success")],
+        [btn("📋 Список промокодов", callback_data="promo_list", style="success")],
+        [btn("🗑 Очистить использованные", callback_data="promo_clear_confirm", style="danger")],
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")]
     ])
 
@@ -1413,7 +1413,7 @@ async def help_command(message: Message):
         "Не переживайте — если что-то пошло не так, мы обязательно разберёмся и поможем 🤝\n\n"
         "Опишите свой вопрос или проблему, а также приложите фото или файл (например, скриншот ошибки или чек об оплате) — так мы сможем помочь быстрее.\n\n"
         "Нажмите кнопку ниже, чтобы написать администраторам:",
-        reply_markup=support_keyboard()
+        reply_markup=support_keyboard(style="success")
     )
 
 @dp.message(Command("about"))
@@ -2443,8 +2443,8 @@ async def open_ticket(callback: CallbackQuery):
         await callback.answer("Тикет не найден", show_alert=True)
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✉️ Ответить", callback_data=f"reply_{ticket_id}")],
-        [InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close_{ticket_id}")],
+        [btn("✉️ Ответить", callback_data=f"reply_{ticket_id}", style="success")],
+        [btn("❌ Закрыть", callback_data=f"close_{ticket_id}", style="danger")],
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")]
     ])
     items = ticket_attachments(ticket)
@@ -2502,22 +2502,105 @@ async def reply_ticket(callback: CallbackQuery, state: FSMContext):
     await safe_edit(callback, "✉️ Введите текст ответа:", reply_markup=admin_back_keyboard())
     await callback.answer()
 
+_reply_albums = {}   # (admin_id, media_group_id) -> {"items": [...], "text": str, "ticket_id": int}
+
+async def _send_answer_to_user(user_id: int, text: str, items, _escaped=False) -> bool:
+    """Отправляет ответ поддержки пользователю: текст и/или фото, видео, файлы.
+    Возвращает True, если доставлено."""
+    caption = "📩 <b>Ответ поддержки:</b>" + (f"\n\n{text}" if text else "")
+    try:
+        if not items:
+            await bot.send_message(user_id, caption)
+            return True
+        media = [i for i in items if i[0] in ("photo", "video")]
+        docs = [i for i in items if i[0] == "document"]
+        use_caption = len(caption) <= 1000      # лимит подписи в Telegram — 1024
+        cap = caption if use_caption else None
+        if len(media) >= 2:
+            group = []
+            for idx, (t, f) in enumerate(media):
+                c = cap if idx == 0 else None
+                group.append(InputMediaPhoto(media=f, caption=c) if t == "photo" else InputMediaVideo(media=f, caption=c))
+            await bot.send_media_group(user_id, group)
+            cap = None
+        elif media:
+            t, f = media[0]
+            if t == "photo":
+                await bot.send_photo(user_id, f, caption=cap)
+            else:
+                await bot.send_video(user_id, f, caption=cap)
+            cap = None
+        for t, f in docs:
+            await bot.send_document(user_id, f, caption=cap)
+            cap = None
+        if not use_caption:
+            await bot.send_message(user_id, caption)
+        return True
+    except Exception as e:
+        if not _escaped and "parse" in str(e).lower():
+            # В тексте админа попался «<» или другая HTML-разметка, которую Telegram не принял —
+            # отправляем тот же текст как обычный.
+            return await _send_answer_to_user(user_id, html_escape(text), items, _escaped=True)
+        logging.warning(f"Не удалось отправить ответ поддержки пользователю {user_id}: {e}")
+        return False
+
+async def _deliver_ticket_answer(ticket_id: int, text: str, items, reply_to: Message, state: FSMContext):
+    ticket = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
+    delivered = True
+    if ticket:
+        delivered = await _send_answer_to_user(ticket[1], text, items)
+        saved_answer = text or (f"[вложения: {attachments_summary(items)}]" if items else "")
+        await asyncio.to_thread(
+            db.conn.execute,
+            "UPDATE tickets SET answer=?, status='Закрыт', closed_at=? WHERE id=?",
+            (saved_answer, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticket_id)
+        )
+        await asyncio.to_thread(db.conn.commit)
+    await state.clear()
+    if delivered:
+        await reply_to.answer("✅ Ответ отправлен!", reply_markup=admin_back_keyboard())
+    else:
+        await reply_to.answer("⚠️ Не удалось доставить ответ (возможно, пользователь заблокировал бота). Тикет закрыт.",
+                              reply_markup=admin_back_keyboard())
+
+async def _finalize_reply_album(key, first_message: Message, state: FSMContext):
+    await asyncio.sleep(TICKET_ALBUM_WAIT)
+    buf = _reply_albums.pop(key, None)
+    if not buf:
+        return
+    items = [it for _, it in sorted(buf["items"], key=lambda x: x[0])]
+    try:
+        await _deliver_ticket_answer(buf["ticket_id"], buf["text"], items, first_message, state)
+    except Exception as e:
+        logging.error(f"Ошибка отправки ответа с альбомом: {e}")
+
 @dp.message(ReplyState.waiting_answer)
 async def send_ticket_answer(message: Message, state: FSMContext):
     if not await asyncio.to_thread(db.is_admin, message.from_user.id):
         return
     data = await state.get_data()
     ticket_id = data["ticket_id"]
-    ticket = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
-    if ticket:
-        try:
-            await bot.send_message(ticket[1], f"📩 <b>Ответ поддержки:</b>\n\n{message.text}")
-        except:
-            pass
-        await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET answer=?, status='Закрыт', closed_at=? WHERE id=?", (message.text, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticket_id))
-        await asyncio.to_thread(db.conn.commit)
-    await state.clear()
-    await message.answer("✅ Ответ отправлен!", reply_markup=admin_back_keyboard())
+    text = (message.text or message.caption or "").strip()
+    item = _ticket_media_item(message)
+
+    # Альбом приходит несколькими сообщениями — собираем и отправляем одним ответом
+    if message.media_group_id:
+        key = (message.from_user.id, message.media_group_id)
+        buf = _reply_albums.get(key)
+        if buf is None:
+            buf = {"items": [], "text": "", "ticket_id": ticket_id}
+            _reply_albums[key] = buf
+            _spawn(_finalize_reply_album(key, message, state))
+        if item:
+            buf["items"].append((message.message_id, item))
+        if text and not buf["text"]:
+            buf["text"] = text
+        return
+
+    if not text and not item:
+        await message.answer("❌ Пришлите текст, фото, видео или файл с ответом.")
+        return
+    await _deliver_ticket_answer(ticket_id, text, [item] if item else [], message, state)
 
 @dp.callback_query(F.data.startswith("close_"))
 async def close_ticket(callback: CallbackQuery):
