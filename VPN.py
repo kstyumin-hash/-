@@ -4,6 +4,7 @@
 # ==========================================================
 
 import asyncio
+from html import escape as html_escape
 import logging
 import aiohttp
 import psycopg2
@@ -33,7 +34,9 @@ from aiogram.types import (
     BotCommand,
     ErrorEvent,
     LabeledPrice,
-    PreCheckoutQuery
+    PreCheckoutQuery,
+    InputMediaPhoto,
+    InputMediaVideo
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -712,6 +715,9 @@ class Database:
         # Нужна для авточистки: удаляем по возрасту ЗАКРЫТИЯ, а не создания,
         # и только закрытые тикеты — открытые обращения не трогаем никогда.
         self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TEXT DEFAULT ''")
+        # Все вложения тикета одним JSON-списком: [{"t": "photo"|"video"|"document", "f": file_id}, ...]
+        # (file_id/file_type выше остаются для старых тикетов и превью — туда пишется первое вложение)
+        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS attachments TEXT DEFAULT ''")
 
         # Флаг «принял условия использования / политику конфиденциальности» —
         # чтобы приветственный экран показывался пользователю ровно один раз.
@@ -1181,7 +1187,7 @@ def back_keyboard():
 
 def vless_key_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Сбросить ключ", callback_data="reset_vless_key")],
+        [btn("🔄 Сбросить ключ", callback_data="reset_vless_key", style="danger")],
         [btn("⬅ Назад", callback_data="profile", style="success")]
     ])
 
@@ -1214,8 +1220,13 @@ def ticket_list_keyboard(tickets):
     for ticket in tickets:
         preview = ticket[2][:20] if ticket[2] else ""
         if not preview:
-            file_type = ticket[6] if len(ticket) > 6 else ""
-            preview = "📷 Фото" if file_type == "photo" else ("📎 Файл" if file_type == "document" else "…")
+            items = ticket_attachments(ticket)
+            if len(items) > 1:
+                preview = "📎 " + attachments_summary(items)
+            elif items:
+                preview = {"photo": "📷 Фото", "video": "🎬 Видео", "document": "📎 Файл"}.get(items[0][0], "…")
+            else:
+                preview = "…"
         buttons.append([InlineKeyboardButton(text=f"🎟 #{ticket[0]} | {preview}", callback_data=f"ticket_{ticket[0]}")])
     buttons.append([InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -2074,43 +2085,134 @@ async def promo_use(message: Message, state: FSMContext):
 # SUPPORT TICKETS
 ############################################################
 
+TICKET_MAX_PHOTOS = 5      # фото в одном обращении
+TICKET_MAX_VIDEOS = 1      # видео в одном обращении
+TICKET_MAX_DOCS = 1        # файл (как и раньше — один)
+TICKET_ALBUM_WAIT = 1.5    # сек: сколько ждём остальные части альбома после первой
+
+_TICKET_CAPS = {"photo": TICKET_MAX_PHOTOS, "video": TICKET_MAX_VIDEOS, "document": TICKET_MAX_DOCS}
+_ticket_albums = {}        # (user_id, media_group_id) -> {"items": [...], "text": str, "rejected": bool}
+
+def ticket_attachments(ticket):
+    """Список (тип, file_id) вложений тикета. Старые тикеты (одно вложение в
+    file_id/file_type) читаются так же."""
+    raw = ticket[8] if len(ticket) > 8 else ""
+    if raw:
+        try:
+            res = [(i["t"], i["f"]) for i in json.loads(raw) if i.get("t") and i.get("f")]
+            if res:
+                return res
+        except Exception:
+            pass
+    file_id = ticket[5] if len(ticket) > 5 else ""
+    file_type = ticket[6] if len(ticket) > 6 else ""
+    return [(file_type, file_id)] if file_id and file_type else []
+
+def attachments_summary(items):
+    names = (("photo", "фото"), ("video", "видео"), ("document", "файл"))
+    parts = []
+    for t, name in names:
+        n = sum(1 for x in items if x[0] == t)
+        if n:
+            parts.append(f"{n} {name}")
+    return ", ".join(parts)
+
+def _limit_ticket_items(items):
+    counts, kept, dropped = {}, [], 0
+    for t, f in items:
+        if counts.get(t, 0) < _TICKET_CAPS.get(t, 0):
+            counts[t] = counts.get(t, 0) + 1
+            kept.append((t, f))
+        else:
+            dropped += 1
+    return kept, dropped
+
+def _ticket_media_item(message: Message):
+    if message.photo:
+        return ("photo", message.photo[-1].file_id)
+    if message.video:
+        return ("video", message.video.file_id)
+    if message.document:
+        return ("document", message.document.file_id)
+    return None
+
 @dp.callback_query(F.data == "create_ticket")
 async def create_ticket(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TicketState.waiting_text)
     await callback.message.edit_text(
-        "📝 Опишите вашу проблему или напишите по поводу оплаты в одном сообщении.\n\n"
-        "Можно приложить фото или файл (например, скриншот или чек):",
+        f"📝 Опишите вашу проблему или напишите по поводу оплаты в одном сообщении.\n\n"
+        f"📸 Можно приложить до {TICKET_MAX_PHOTOS} фото и {TICKET_MAX_VIDEOS} видео — "
+        f"выберите несколько файлов сразу и отправьте одним альбомом, описание напишите в подписи. "
+        f"Или один файл (например, чек):",
         reply_markup=back_keyboard()
     )
     await callback.answer()
 
-@dp.message(TicketState.waiting_text, F.text | F.photo | F.document)
-async def process_ticket(message: Message, state: FSMContext):
-    if is_rate_limited(message.from_user.id, "create_ticket", cooldown=10):
-        await message.answer("⏳ Обращение уже отправляется — подождите немного перед следующим.")
+async def _create_ticket(user_id: int, text: str, items, reply_to: Message, state: FSMContext):
+    kept, dropped = _limit_ticket_items(items)
+    if not text and not kept:
+        await reply_to.answer(f"❌ Пришлите текст, фото, видео или файл с описанием проблемы.")
         return
 
-    text = (message.text or message.caption or "").strip()
-    file_id = ""
-    file_type = ""
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        file_type = "photo"
-    elif message.document:
-        file_id = message.document.file_id
-        file_type = "document"
-
-    if not text and not file_id:
-        await message.answer("❌ Пришлите текст, фото или файл с описанием проблемы.")
-        return
-
-    await asyncio.to_thread(db.conn.execute, 
-        "INSERT INTO tickets (user_id, message, answer, status, file_id, file_type) VALUES(?,?,?,?,?,?)",
-        (message.from_user.id, text, "", "Открыт", file_id, file_type)
+    first_type, first_id = kept[0] if kept else ("", "")
+    attachments_json = json.dumps([{"t": t, "f": f} for t, f in kept]) if kept else ""
+    await asyncio.to_thread(db.conn.execute,
+        "INSERT INTO tickets (user_id, message, answer, status, file_id, file_type, attachments) VALUES(?,?,?,?,?,?,?)",
+        (user_id, text, "", "Открыт", first_id, first_type, attachments_json)
     )
     await asyncio.to_thread(db.conn.commit)
     await state.clear()
-    await message.answer("✅ Ваше обращение отправлено в поддержку!", reply_markup=back_keyboard())
+
+    reply = f"✅ Ваше обращение отправлено в поддержку!"
+    if kept:
+        reply += f"\n📸 Приложено: {attachments_summary(kept)}"
+    if dropped:
+        reply += (f"\nℹ️ Часть вложений не принята: в одном обращении можно до "
+                  f"{TICKET_MAX_PHOTOS} фото и {TICKET_MAX_VIDEOS} видео.")
+    await reply_to.answer(reply, reply_markup=back_keyboard())
+
+async def _finalize_ticket_album(key, first_message: Message, state: FSMContext):
+    """Альбом приходит несколькими сообщениями с общим media_group_id. Ждём остальные
+    части и создаём ОДНО обращение со всеми вложениями."""
+    await asyncio.sleep(TICKET_ALBUM_WAIT)
+    buf = _ticket_albums.pop(key, None)
+    if not buf or buf["rejected"]:
+        return
+    items = [it for _, it in sorted(buf["items"], key=lambda x: x[0])]  # в порядке отправки
+    try:
+        await _create_ticket(key[0], buf["text"], items, first_message, state)
+    except Exception as e:
+        logging.error(f"Ошибка создания обращения с альбомом: {e}")
+
+@dp.message(TicketState.waiting_text, F.text | F.photo | F.video | F.document)
+async def process_ticket(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = (message.text or message.caption or "").strip()
+    item = _ticket_media_item(message)
+
+    if message.media_group_id:
+        key = (user_id, message.media_group_id)
+        buf = _ticket_albums.get(key)
+        if buf is None:
+            # Первое сообщение альбома: лимит частоты проверяем один раз на весь альбом
+            rejected = is_rate_limited(user_id, "create_ticket", cooldown=10)
+            buf = {"items": [], "text": "", "rejected": rejected}
+            _ticket_albums[key] = buf
+            _spawn(_finalize_ticket_album(key, message, state))
+            if rejected:
+                await message.answer("⏳ Обращение уже отправляется — подождите немного перед следующим.")
+        if buf["rejected"]:
+            return
+        if item:
+            buf["items"].append((message.message_id, item))
+        if text and not buf["text"]:
+            buf["text"] = text
+        return
+
+    if is_rate_limited(user_id, "create_ticket", cooldown=10):
+        await message.answer("⏳ Обращение уже отправляется — подождите немного перед следующим.")
+        return
+    await _create_ticket(user_id, text, [item] if item else [], message, state)
 
 ############################################################
 # ADMIN PANEL
@@ -2345,18 +2447,49 @@ async def open_ticket(callback: CallbackQuery):
         [InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close_{ticket_id}")],
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")]
     ])
-    caption = f"🎟 <b>Тикет #{ticket[0]}</b>\nПользователь ID: <code>{ticket[1]}</code>\n\nСообщение:\n{ticket[2] or '—'}"
-    file_id = ticket[5] if len(ticket) > 5 else ""
-    file_type = ticket[6] if len(ticket) > 6 else ""
+    items = ticket_attachments(ticket)
+    caption = (f"🎟 <b>Тикет #{ticket[0]}</b>\n"
+               f"👤 Пользователь ID: <code>{ticket[1]}</code>\n\n"
+               f"💬 Сообщение:\n{html_escape(ticket[2]) if ticket[2] else '—'}")
+    if items:
+        caption += f"\n\n📸 Вложения: {attachments_summary(items)}"
 
-    if file_type == "photo" and file_id:
-        await callback.message.delete()
-        await callback.message.answer_photo(photo=file_id, caption=caption, reply_markup=keyboard)
-    elif file_type == "document" and file_id:
-        await callback.message.delete()
-        await callback.message.answer_document(document=file_id, caption=caption, reply_markup=keyboard)
-    else:
+    async def send_one(kind, file_id, cap=None, markup=None):
+        if kind == "photo":
+            return await callback.message.answer_photo(photo=file_id, caption=cap, reply_markup=markup)
+        if kind == "video":
+            return await callback.message.answer_video(video=file_id, caption=cap, reply_markup=markup)
+        return await callback.message.answer_document(document=file_id, caption=cap, reply_markup=markup)
+
+    if not items:
         await callback.message.edit_text(caption, reply_markup=keyboard)
+        await callback.answer()
+        return
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    try:
+        if len(items) == 1 and len(caption) <= 1000:
+            # Одно вложение — как раньше: подпись и кнопки прямо под ним
+            await send_one(items[0][0], items[0][1], caption, keyboard)
+        else:
+            media = [i for i in items if i[0] in ("photo", "video")]
+            docs = [i for i in items if i[0] == "document"]
+            if len(media) >= 2:
+                await callback.message.answer_media_group([
+                    InputMediaPhoto(media=f) if t == "photo" else InputMediaVideo(media=f) for t, f in media
+                ])
+            elif media:
+                await send_one(media[0][0], media[0][1])
+            for t, f in docs:
+                await send_one(t, f)
+            # У альбома кнопок быть не может — текст с кнопками идёт отдельным сообщением
+            await callback.message.answer(caption, reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"Тикет #{ticket_id}: не удалось показать вложения: {e}")
+        await callback.message.answer(caption + "\n\n⚠️ Не удалось загрузить вложения.", reply_markup=keyboard)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("reply_"))
