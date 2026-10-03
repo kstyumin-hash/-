@@ -2587,8 +2587,8 @@ async def platega_status_checker():
             logging.error(f"Ошибка platega_status_checker: {e}")
         await asyncio.sleep(PLATEGA_POLL_INTERVAL)
 
-PLATEGA_DEAD_RETENTION_DAYS = 7      # отменённые/зависшие транзакции Platega
-PLATEGA_DONE_RETENTION_DAYS = 180    # оплаченные транзакции — храним для учёта полгода
+PLATEGA_DEAD_RETENTION_DAYS = 14     # отменённые/зависшие транзакции Platega
+PLATEGA_DONE_RETENTION_DAYS = 14     # оплаченные транзакции тоже удаляем через 14 дней
 STARS_RETENTION_DAYS = 180
 CLEANUP_INTERVAL_SECONDS = 24 * 3600  # проверка раз в сутки
 
@@ -2609,7 +2609,7 @@ async def db_cleanup_task():
     - tickets: только ЗАКРЫТЫЕ старше CLOSED_TICKETS_RETENTION_DAYS (вместе с текстом,
       ответом и file_id). Открытые не удаляются никогда. Закрытые без даты закрытия
       (старые записи) получают дату сегодня и уйдут по сроку.
-    - platega_transactions: отменённые/неоплаченные старше 7 дней; оплаченные — старше 180.
+    - platega_transactions: ВСЕ транзакции старше 14 дней (отменённые, неоплаченные и оплаченные).
       Зависшие PROCESSING (сбой во время начисления) возвращаются в PENDING.
     - stars_payments: старше 180 дней.
     - used_promos: записи о промокодах, которых уже нет в promo_codes.
