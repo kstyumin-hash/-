@@ -80,6 +80,12 @@ BOT_USERNAME = None  # кэшируется один раз при старте,
 # VPN API CLIENT (3x-ui)
 ############################################################
 
+PANEL_ATTEMPTS = 3   # попыток на один запрос к панели 3x-ui при временных сбоях
+
+class PanelError(Exception):
+    """Панель 3x-ui недоступна или ответила непонятно. Это НЕ то же самое, что
+    «клиента нет»: путать их нельзя, иначе бот попытается создать дубликат."""
+
 class VPNClient:
     """Клиент для панели 3x-ui (https://github.com/MHSanaei/3x-ui).
 
@@ -92,6 +98,16 @@ class VPNClient:
       у клиента (переменная окружения THREEXUI_DEVICE_LIMIT, по умолчанию 5);
     - готовая ссылка не возвращается напрямую, как в Marzban — используется
       сервис подписки 3x-ui: https://host:SUB_PORT/SUB_PATH/{subId}.
+
+    Устойчивость:
+    - сессия панели протухает; новые версии 3x-ui на просроченную сессию отвечают
+      404 (а не 401), старые — 401 или HTML-страницей логина. Все эти случаи ловятся:
+      бот перелогинивается и повторяет запрос (раньше он «залипал» в состоянии
+      «авторизован» до перезапуска, и все операции с панелью молча падали);
+    - временные сбои (обрыв, таймаут, 5xx) повторяются;
+    - записи в inbound сериализуются: панель перезаписывает settings inbound'а
+      целиком, и параллельные addClient/updateClient могли затирать друг друга;
+    - «не удалось спросить панель» отличается от «клиента нет» (PanelError).
     """
     def __init__(self):
         self.base_url = VPN_API_URL.rstrip("/")
@@ -103,19 +119,32 @@ class VPNClient:
         self.sub_path = os.environ.get("THREEXUI_SUB_PATH", "sub").strip("/")
         self._session = None
         self._logged_in = False
+        self._login_gen = 0        # растёт после каждого успешного логина
+        self._login_lock = None    # локи создаются лениво — уже внутри event loop
+        self._write_lock = None
+
+    def _init_locks(self):
+        if self._login_lock is None:
+            self._login_lock = asyncio.Lock()
+            self._write_lock = asyncio.Lock()
 
     def _get_session(self):
-        # Один переиспользуемый session — он же хранит cookie сессии 3x-ui
-        # между запросами, поэтому логиниться заново на каждый вызов не нужно.
+        # Один переиспользуемый session — он же хранит cookie сессии 3x-ui между
+        # запросами. unsafe=True: иначе aiohttp не сохраняет cookie, если панель
+        # открыта по IP-адресу, и каждый запрос шёл бы «неавторизованным».
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=8, connect=4),
+                cookie_jar=aiohttp.CookieJar(unsafe=True),
+                connector=aiohttp.TCPConnector(ttl_dns_cache=300, limit=10)
+            )
         return self._session
 
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def login(self):
+    async def _do_login(self):
         session = self._get_session()
         try:
             async with session.post(
@@ -123,69 +152,94 @@ class VPNClient:
                 data={"username": self.username, "password": self.password}
             ) as resp:
                 try:
-                    data = await resp.json()
+                    data = await resp.json(content_type=None)
                 except Exception:
                     data = {}
-                self._logged_in = resp.status == 200 and data.get("success", False)
-                if not self._logged_in:
+                self._logged_in = (resp.status == 200 and isinstance(data, dict)
+                                   and bool(data.get("success", False)))
+                if self._logged_in:
+                    self._login_gen += 1
+                else:
                     logging.error(f"3x-ui: не удалось авторизоваться (status={resp.status})")
         except Exception as e:
             logging.error(f"Ошибка авторизации в 3x-ui: {e}")
             self._logged_in = False
 
-    async def _api_get(self, path):
-        if not self._logged_in:
-            await self.login()
-        session = self._get_session()
-        for attempt in range(2):
-            try:
-                async with session.get(f"{self.base_url}{path}") as resp:
-                    if resp.status == 401 and attempt == 0:
-                        await self.login()
-                        continue
-                    try:
-                        return await resp.json()
-                    except Exception:
-                        return None
-            except Exception as e:
-                logging.error(f"Ошибка запроса к 3x-ui ({path}): {e}")
-                return None
-        return None
+    async def _ensure_login(self, seen_gen):
+        """Логинится, если никто другой не успел сделать это после seen_gen —
+        при одновременном «протухании» сессии логин будет один, а не по числу запросов."""
+        self._init_locks()
+        async with self._login_lock:
+            if self._logged_in and self._login_gen != seen_gen:
+                return True
+            await self._do_login()
+            return self._logged_in
 
-    async def _api_post(self, path, payload):
-        if not self._logged_in:
-            await self.login()
-        session = self._get_session()
-        for attempt in range(2):
-            try:
-                async with session.post(
-                    f"{self.base_url}{path}",
-                    json=payload,
-                    headers={"Content-Type": "application/json"}
-                ) as resp:
-                    if resp.status == 401 and attempt == 0:
-                        await self.login()
+    async def login(self):
+        return await self._ensure_login(self._login_gen)
+
+    async def _request(self, method, path, **kwargs):
+        """Возвращает (status, data), data — разобранный JSON или None.
+        Перелогинивается при отклонённой сессии, повторяет запрос при временных сбоях.
+        Бросает PanelError, если панель так и не ответила."""
+        url = f"{self.base_url}{path}"
+        relogged = False
+        last_err = "нет ответа"
+        for attempt in range(1, PANEL_ATTEMPTS + 1):
+            gen = self._login_gen
+            if not self._logged_in and not await self._ensure_login(gen):
+                last_err = "не удалось авторизоваться"
+            else:
+                try:
+                    async with self._get_session().request(method, url, **kwargs) as resp:
+                        status = resp.status
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception:
+                            data = None
+                    if status >= 500 or status == 429:
+                        last_err = f"HTTP {status}"
+                    elif status in (401, 403, 404) or (status == 200 and data is None):
+                        # Сессия отклонена (401/404) или вместо JSON пришла страница логина.
+                        if relogged:
+                            return status, data
+                        relogged = True
+                        last_err = f"сессия отклонена (HTTP {status})"
+                        await self._ensure_login(gen)
                         continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        # 3x-ui иногда отвечает пустой строкой вместо JSON — известная особенность панели.
-                        data = None
-                    return resp.status == 200 and data is not None and data.get("success", False)
-            except Exception as e:
-                logging.error(f"Ошибка запроса к 3x-ui ({path}): {e}")
-                return False
-        return False
+                    else:
+                        return status, data
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_err = repr(e)
+            logging.warning(f"3x-ui {method} {path}: {last_err} (попытка {attempt}/{PANEL_ATTEMPTS})")
+            if attempt < PANEL_ATTEMPTS:
+                await asyncio.sleep(0.5 * attempt)
+        raise PanelError(f"{method} {path}: {last_err}")
+
+    async def _api_post(self, path, payload=None):
+        try:
+            if payload is None:
+                status, data = await self._request("POST", path)
+            else:
+                status, data = await self._request("POST", path, json=payload)
+        except PanelError as e:
+            logging.error(f"Ошибка запроса к 3x-ui: {e}")
+            return False
+        ok = status == 200 and isinstance(data, dict) and bool(data.get("success", False))
+        if not ok:
+            logging.error(f"3x-ui {path}: отказ (HTTP {status}): {data}")
+        return ok
 
     async def _find_existing_client(self, email):
-        """Возвращает (client_dict) существующего клиента по email или None."""
-        data = await self._api_get(f"/panel/api/inbounds/get/{self.inbound_id}")
-        if not data or not data.get("success") or not data.get("obj"):
-            return None
+        """Возвращает dict существующего клиента по email или None, если клиента нет.
+        Бросает PanelError, если панель не ответила / inbound не прочитался."""
+        status, data = await self._request("GET", f"/panel/api/inbounds/get/{self.inbound_id}")
+        if status != 200 or not isinstance(data, dict) or not data.get("success") or not data.get("obj"):
+            raise PanelError(f"не удалось прочитать inbound {self.inbound_id} (HTTP {status})")
         try:
-            settings = json.loads(data["obj"].get("settings", "{}"))
-        except Exception:
-            return None
+            settings = json.loads(data["obj"].get("settings") or "{}")
+        except Exception as e:
+            raise PanelError(f"settings inbound {self.inbound_id} не разобрались: {e}")
         for client in settings.get("clients", []):
             if client.get("email") == email:
                 return client
@@ -202,104 +256,120 @@ class VPNClient:
         # чтобы не возвращать пустую строку молча.
         return sub_id
 
-    async def create_or_update_user(self, user_id, expire_timestamp):
+    def _client_payload(self, base, client_uuid, email, expiry_ms, sub_id):
+        # Для существующего клиента берём ВСЕ его поля (comment, security и т.д.) и меняем
+        # только нужные — иначе updateClient затирал бы всё, чего нет в нашем словаре.
+        payload = dict(base or {})
+        payload.update({
+            "id": client_uuid,
+            "email": email,
+            "enable": True,
+            "expiryTime": expiry_ms,
+            "limitIp": self.device_limit,
+            "subId": sub_id,
+        })
+        for key, default in (("totalGB", 0), ("tgId", ""), ("reset", 0), ("flow", "")):
+            payload.setdefault(key, default)
+        return payload
+
+    async def _create_or_update_locked(self, user_id, expire_timestamp):
+        # Вызывать только под self._write_lock.
         email = f"user_{user_id}"
         expiry_ms = int(expire_timestamp) * 1000  # 3x-ui ждёт миллисекунды, не секунды
 
-        existing = await self._find_existing_client(email)
+        try:
+            existing = await self._find_existing_client(email)
+        except PanelError as e:
+            logging.error(f"3x-ui: не удалось проверить клиента {email}: {e}")
+            return ""
 
-        if existing:
-            client_uuid = existing.get("id")
-            sub_id = existing.get("subId") or uuid.uuid4().hex
-            client_payload = {
-                "id": client_uuid,
-                "email": email,
-                "enable": True,
-                "expiryTime": expiry_ms,
-                "limitIp": self.device_limit,
-                "totalGB": existing.get("totalGB", 0),
-                "tgId": existing.get("tgId", ""),
-                "subId": sub_id,
-                "reset": existing.get("reset", 0),
-                "flow": existing.get("flow", "")
-            }
-            ok = await self._api_post(
-                f"/panel/api/inbounds/updateClient/{client_uuid}",
-                {"id": self.inbound_id, "settings": json.dumps({"clients": [client_payload]})}
-            )
-        else:
+        if not existing:
             client_uuid = str(uuid.uuid4())
             sub_id = uuid.uuid4().hex
-            client_payload = {
-                "id": client_uuid,
-                "email": email,
-                "enable": True,
-                "expiryTime": expiry_ms,
-                "limitIp": self.device_limit,
-                "totalGB": 0,
-                "tgId": "",
-                "subId": sub_id,
-                "reset": 0,
-                "flow": ""
-            }
-            ok = await self._api_post(
+            payload = self._client_payload(None, client_uuid, email, expiry_ms, sub_id)
+            if await self._api_post(
                 "/panel/api/inbounds/addClient",
-                {"id": self.inbound_id, "settings": json.dumps({"clients": [client_payload]})}
-            )
+                {"id": self.inbound_id, "settings": json.dumps({"clients": [payload]})}
+            ):
+                return self._build_sub_link(sub_id)
+            # Ответ мог потеряться, хотя клиент уже создан, — проверяем, а не плодим дубль.
+            try:
+                existing = await self._find_existing_client(email)
+            except PanelError:
+                existing = None
+            if not existing:
+                return ""
 
-        if not ok:
-            return ""
-        return self._build_sub_link(sub_id)
+        client_uuid = existing.get("id")
+        sub_id = existing.get("subId") or uuid.uuid4().hex
+        payload = self._client_payload(existing, client_uuid, email, expiry_ms, sub_id)
+        ok = await self._api_post(
+            f"/panel/api/inbounds/updateClient/{client_uuid}",
+            {"id": self.inbound_id, "settings": json.dumps({"clients": [payload]})}
+        )
+        return self._build_sub_link(sub_id) if ok else ""
+
+    async def create_or_update_user(self, user_id, expire_timestamp):
+        self._init_locks()
+        async with self._write_lock:
+            return await self._create_or_update_locked(user_id, expire_timestamp)
 
     async def disable_user(self, user_id):
         # Реально отключает доступ на стороне 3x-ui (а не только в БД бота) —
         # без этого Happ/v2rayTun продолжали бы работать с ключом после истечения дней.
+        self._init_locks()
         email = f"user_{user_id}"
-        existing = await self._find_existing_client(email)
-        if not existing:
-            return False
-        existing["enable"] = False
-        return await self._api_post(
-            f"/panel/api/inbounds/updateClient/{existing['id']}",
-            {"id": self.inbound_id, "settings": json.dumps({"clients": [existing]})}
-        )
+        async with self._write_lock:
+            try:
+                existing = await self._find_existing_client(email)
+            except PanelError as e:
+                logging.error(f"3x-ui: не удалось проверить клиента {email}: {e}")
+                return False
+            if not existing:
+                return False
+            payload = dict(existing)
+            payload["enable"] = False
+            return await self._api_post(
+                f"/panel/api/inbounds/updateClient/{existing['id']}",
+                {"id": self.inbound_id, "settings": json.dumps({"clients": [payload]})}
+            )
 
     async def delete_client(self, client_uuid):
         # Полное удаление клиента на панели 3x-ui — именно это делает старый
         # ключ нерабочим (в отличие от updateClient, id/subId остаются старыми).
-        if not self._logged_in:
-            await self.login()
-        session = self._get_session()
-        for attempt in range(2):
-            try:
-                async with session.post(
-                    f"{self.base_url}/panel/api/inbounds/{self.inbound_id}/delClient/{client_uuid}"
-                ) as resp:
-                    if resp.status == 401 and attempt == 0:
-                        await self.login()
-                        continue
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = None
-                    return resp.status == 200 and data is not None and data.get("success", False)
-            except Exception as e:
-                logging.error(f"Ошибка удаления клиента в 3x-ui: {e}")
-                return False
-        return False
+        self._init_locks()
+        async with self._write_lock:
+            return await self._api_post(f"/panel/api/inbounds/{self.inbound_id}/delClient/{client_uuid}")
 
     async def reset_user_key(self, user_id, expire_timestamp):
         """Полностью пересоздаёт ключ пользователя: старый клиент удаляется
         на панели 3x-ui (перестаёт работать сразу и необратимо), взамен
         создаётся новый клиент с новым id и новым subId — то есть выдаётся
         совсем другой ключ, а не обновление старого."""
+        self._init_locks()
         email = f"user_{user_id}"
-        existing = await self._find_existing_client(email)
-        if existing and existing.get("id"):
-            await self.delete_client(existing["id"])
-        # После удаления create_or_update_user не найдёт старого клиента
-        # и создаст новый — с новым uuid и subId.
-        return await self.create_or_update_user(user_id, expire_timestamp)
+        async with self._write_lock:
+            try:
+                existing = await self._find_existing_client(email)
+            except PanelError as e:
+                logging.error(f"3x-ui: не удалось проверить клиента {email}: {e}")
+                return ""
+            if existing and existing.get("id"):
+                deleted = await self._api_post(
+                    f"/panel/api/inbounds/{self.inbound_id}/delClient/{existing['id']}"
+                )
+                if not deleted:
+                    # Ответ на удаление мог не разобраться — смотрим, удалился ли клиент на деле.
+                    try:
+                        still_there = await self._find_existing_client(email)
+                    except PanelError:
+                        still_there = existing
+                    if still_there:
+                        # Старый клиент жив: «новый» ключ оказался бы тем же самым.
+                        logging.error(f"3x-ui: не удалось удалить старого клиента {email}, сброс ключа отменён")
+                        return ""
+            # После удаления создастся новый клиент — с новым uuid и subId.
+            return await self._create_or_update_locked(user_id, expire_timestamp)
 
 vpn_client = VPNClient()
 
@@ -411,7 +481,7 @@ class PlategaClient:
         session = self._get_session()
         try:
             async with session.get(f"{self.base_url}/transaction/{transaction_id}") as resp:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
                 if resp.status != 200:
                     logging.error(f"Platega get_transaction_status ошибка {resp.status}: {data}")
                     return None
@@ -624,6 +694,7 @@ class Database:
         # (упоминает vless_key) падает с UndefinedColumn для КАЖДОГО нового
         # пользователя, реферал тут вообще ни при чём.
         self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vless_key TEXT DEFAULT ''")
+        self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_key_reset TEXT DEFAULT ''")
         
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS tickets(
@@ -1111,7 +1182,7 @@ def back_keyboard():
 def vless_key_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Сбросить ключ", callback_data="reset_vless_key")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="profile", style="danger")]
+        [btn("⬅ Назад", callback_data="profile", style="success")]
     ])
 
 def admin_back_keyboard():
@@ -1461,6 +1532,8 @@ async def get_vless_key(callback: CallbackQuery):
     )
     await callback.answer()
 
+KEY_RESET_COOLDOWN_HOURS = 24   # как часто можно перевыпускать ключ
+
 @dp.callback_query(F.data == "reset_vless_key")
 async def reset_vless_key(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1471,17 +1544,48 @@ async def reset_vless_key(callback: CallbackQuery):
         await callback.answer("❌ Подписка неактивна. Оплатите дни, чтобы получить ключ для Happ.", show_alert=True)
         return
 
-    await callback.answer("🔄 Обновляем ключ…")
-
     new_key = ""
-    try:
-        expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
-        timestamp = int(expire_dt.timestamp())
-        new_key = await vpn_client.reset_user_key(user_id, timestamp)
-        await asyncio.to_thread(db.conn.execute, "UPDATE users SET vless_key=? WHERE id=?", (new_key, user_id))
-        await asyncio.to_thread(db.conn.commit)
-    except Exception as e:
-        logging.error(f"Ошибка сброса ключа через API: {e}")
+    # Под локом пользователя: проверка лимита и сброс — одним блоком, чтобы двойной клик
+    # не позволил перевыпустить ключ дважды.
+    async with user_locks[user_id]:
+        row = (await asyncio.to_thread(
+            db.conn.execute, "SELECT last_key_reset FROM users WHERE id=?", (user_id,)
+        )).fetchone()
+        last_reset = None
+        if row and row[0]:
+            try:
+                last_reset = datetime.fromisoformat(row[0])
+            except Exception:
+                last_reset = None
+        if last_reset:
+            left = last_reset + timedelta(hours=KEY_RESET_COOLDOWN_HOURS) - datetime.now()
+            if left.total_seconds() > 0:
+                total_min = max(1, -(-int(left.total_seconds()) // 60))  # округление вверх до минуты
+                h, m = divmod(total_min, 60)
+                left_text = f"{h} ч {m} мин" if h else f"{m} мин"
+                await callback.answer(
+                    f"⏳ Ключ можно перевыпускать раз в {KEY_RESET_COOLDOWN_HOURS} часа. "
+                    f"Следующий раз — через {left_text}.",
+                    show_alert=True
+                )
+                return
+
+        await callback.answer("🔄 Обновляем ключ…")
+
+        try:
+            expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+            timestamp = int(expire_dt.timestamp())
+            new_key = await vpn_client.reset_user_key(user_id, timestamp)
+            if new_key:
+                # Время сброса пишем только при успехе — неудачная попытка лимит не тратит
+                await asyncio.to_thread(
+                    db.conn.execute,
+                    "UPDATE users SET vless_key=?, last_key_reset=? WHERE id=?",
+                    (new_key, datetime.now().isoformat(), user_id)
+                )
+                await asyncio.to_thread(db.conn.commit)
+        except Exception as e:
+            logging.error(f"Ошибка сброса ключа через API: {e}")
 
     if not new_key:
         await callback.message.edit_text(
@@ -1601,12 +1705,20 @@ async def process_platega_pay(callback: CallbackQuery):
         )
         return
 
-    try:
-        await asyncio.to_thread(
-            db.create_platega_transaction, transaction_id, user.id, tariff_id, method_id, tariff["price"]
-        )
-    except Exception as e:
-        logging.error(f"Не удалось сохранить транзакцию Platega {transaction_id}: {e}")
+    # Транзакция уже создана в Platega — если не сохранить её в БД, оплата не начислится.
+    # Поэтому при сбое БД (например, «проснулась» после простоя) пробуем ещё пару раз.
+    saved = False
+    for db_attempt in range(1, 4):
+        try:
+            await asyncio.to_thread(
+                db.create_platega_transaction, transaction_id, user.id, tariff_id, method_id, tariff["price"]
+            )
+            saved = True
+            break
+        except Exception as e:
+            logging.error(f"Не удалось сохранить транзакцию Platega {transaction_id} (попытка {db_attempt}/3): {e}")
+            await asyncio.sleep(0.5 * db_attempt)
+    if not saved:
         await callback.message.edit_text(
             "❌ Не удалось создать платёж. Попробуйте ещё раз через минуту.",
             reply_markup=payment_method_keyboard()
@@ -1630,21 +1742,55 @@ def _end_of_day(dt):
     чтобы ключ не отключался раньше, чем показывает бот."""
     return dt.replace(hour=23, minute=59, second=59, microsecond=0)
 
+_panel_resync = {}   # user_id -> expire_dt: срок, который не удалось записать на панель
+
 async def _sync_panel(user_id: int, expire_dt) -> bool:
     """Обновляет срок ключа на панели. create_or_update_user при сбое возвращает
-    пустую строку (а не исключение) — раньше это молча терялось."""
+    пустую строку (а не исключение). Повторы при временных сбоях сети/панели делает
+    сам клиент 3x-ui; если панель недоступна дольше — срок встаёт в очередь
+    _panel_resync, и panel_resync_task дозапишет его автоматически."""
     try:
         res = await vpn_client.create_or_update_user(user_id, int(expire_dt.timestamp()))
         if res:
+            _panel_resync.pop(user_id, None)
             return True
         logging.error(f"Панель 3x-ui не подтвердила продление для {user_id}")
     except Exception as e:
         logging.error(f"Ошибка синхронизации с панелью для {user_id}: {e}")
+    _panel_resync[user_id] = expire_dt
     try:
-        await bot.send_message(OWNER_ID, f"⚠️ Оплата прошла, но ключ {user_id} НЕ обновился на панели 3x-ui — проверь вручную (срок до {expire_dt:%Y-%m-%d}).")
+        await bot.send_message(OWNER_ID, f"⚠️ Оплата прошла, но ключ {user_id} не обновился на панели 3x-ui (срок до {expire_dt:%Y-%m-%d}). Бот будет повторять попытку каждую минуту и напишет, когда получится.")
     except Exception:
         pass
     return False
+
+async def panel_resync_task():
+    """Дозаписывает на панель сроки, которые не удалось записать сразу (панель была
+    недоступна). Работает под локом пользователя, поэтому не затрёт более новую оплату."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            for uid in list(_panel_resync.keys()):
+                async with user_locks[uid]:
+                    exp = _panel_resync.get(uid)  # перечитываем: за время ожидания лока срок мог обновиться
+                    if exp is None:
+                        continue
+                    try:
+                        res = await vpn_client.create_or_update_user(uid, int(exp.timestamp()))
+                    except Exception as e:
+                        logging.error(f"Повторная синхронизация {uid} с панелью не удалась: {e}")
+                        res = ""
+                    if res:
+                        _panel_resync.pop(uid, None)
+                if res:
+                    logging.info(f"Панель 3x-ui: срок для {uid} дозаписан при повторной попытке")
+                    try:
+                        await bot.send_message(OWNER_ID, f"✅ Ключ {uid} успешно обновлён на панели 3x-ui при повторной попытке.")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.error(f"Ошибка panel_resync_task: {e}")
+        await asyncio.sleep(60)
 
 async def _grant_referral_bonus(user_id: int, inviter_id: int):
     async with user_locks[inviter_id]:
@@ -2409,13 +2555,14 @@ async def subscription_checker():
 LOGS_RETENTION_DAYS = 7              # admin_logs и notifications старше — удаляются
 CLOSED_TICKETS_RETENTION_DAYS = 30   # закрытые тикеты (текст, ответ, file_id) старше — удаляются; открытые не трогаем
 PLATEGA_POLL_INTERVAL = 15           # как часто бот спрашивает Platega о статусе, сек
-PLATEGA_POLL_WINDOW_MIN = 60         # проверяем только свежие неоплаченные транзакции, мин
+PLATEGA_POLL_WINDOW_MIN = 360        # проверяем неоплаченные транзакции за последние N минут (6 ч — с запасом на простой бота)
 
 async def platega_status_checker():
-    """Сам опрашивает Platega по неоплаченным транзакциям. Если Platega сообщает, что
-    платёж отменён — автоматически, независимо от действий пользователя и от callback'а,
-    отправляет ему сообщение с кнопкой «Посмотреть тарифы». Переход PENDING -> CANCELED
-    атомарный, поэтому вместе с callback'ом сообщение уйдёт ровно один раз."""
+    """Сам опрашивает Platega по неоплаченным транзакциям, независимо от callback'а:
+    - CONFIRMED — начисляет подписку (если callback не дошёл или начисление упало);
+    - CANCELED — автоматически отправляет пользователю сообщение с кнопкой «Посмотреть тарифы».
+    Переходы статусов атомарные, поэтому вместе с callback'ом начисление и сообщение
+    выполнятся ровно один раз."""
     await asyncio.sleep(10)
     while True:
         try:
@@ -2425,7 +2572,10 @@ async def platega_status_checker():
                 for tx_id in tx_ids:
                     data = await platega_client.get_transaction_status(tx_id)
                     status = str(data.get("status", "")).upper() if isinstance(data, dict) else ""
-                    if status == "CANCELED":
+                    if status == "CONFIRMED":
+                        # Оплата прошла, а callback не дошёл (или начисление упало) — начисляем сами.
+                        _spawn(finalize_platega_confirmed(tx_id))
+                    elif status == "CANCELED":
                         claimed = await asyncio.to_thread(db.claim_platega_transaction, tx_id, "PENDING", "CANCELED")
                         if claimed:
                             try:
@@ -2453,214 +2603,4 @@ def cleanup_memory_state():
     for uid in [u for u, lock in user_locks.items() if not lock.locked()]:
         user_locks.pop(uid, None)
 
-async def db_cleanup_task():
-    """Автоочистка накопительных данных, чтобы БД (Neon) не забивалась.
-    - admin_logs, notifications: старше LOGS_RETENTION_DAYS.
-    - tickets: только ЗАКРЫТЫЕ старше CLOSED_TICKETS_RETENTION_DAYS (вместе с текстом,
-      ответом и file_id). Открытые не удаляются никогда. Закрытые без даты закрытия
-      (старые записи) получают дату сегодня и уйдут по сроку.
-    - platega_transactions: отменённые/неоплаченные старше 7 дней; оплаченные — старше 180.
-      Зависшие PROCESSING (сбой во время начисления) возвращаются в PENDING.
-    - stars_payments: старше 180 дней.
-    - used_promos: записи о промокодах, которых уже нет в promo_codes.
-    users, promo_codes, referrals — не трогаются."""
-    while True:
-        try:
-            now = datetime.now()
-            fmt = "%Y-%m-%d %H:%M:%S"
-            log_cutoff = (now - timedelta(days=LOGS_RETENTION_DAYS)).strftime(fmt)
-            ticket_cutoff = (now - timedelta(days=CLOSED_TICKETS_RETENTION_DAYS)).strftime(fmt)
-            dead_cutoff = (now - timedelta(days=PLATEGA_DEAD_RETENTION_DAYS)).isoformat()
-            done_cutoff = (now - timedelta(days=PLATEGA_DONE_RETENTION_DAYS)).isoformat()
-            stars_cutoff = (now - timedelta(days=STARS_RETENTION_DAYS)).isoformat()
-            ex = lambda q, p=(): asyncio.to_thread(db.conn.execute, q, p)
-
-            deleted_logs = (await ex("DELETE FROM admin_logs WHERE created_at < ?", (log_cutoff,))).rowcount
-            deleted_notifs = (await ex("DELETE FROM notifications WHERE date < ?", (log_cutoff[:10],))).rowcount
-
-            await ex("UPDATE tickets SET closed_at=? WHERE status='Закрыт' AND (closed_at IS NULL OR closed_at='')", (now.strftime(fmt),))
-            deleted_tickets = (await ex(
-                "DELETE FROM tickets WHERE status='Закрыт' AND closed_at != '' AND closed_at < ?", (ticket_cutoff,)
-            )).rowcount
-
-            await ex(
-                "UPDATE platega_transactions SET status='PENDING' WHERE status='PROCESSING' AND created_at < ?",
-                ((now - timedelta(days=1)).isoformat(),)
-            )
-            deleted_tx = (await ex(
-                "DELETE FROM platega_transactions WHERE "
-                "(status NOT IN ('CONFIRMED','CHARGEBACKED','PROCESSING') AND created_at < ?) OR "
-                "(status IN ('CONFIRMED','CHARGEBACKED') AND created_at < ?)",
-                (dead_cutoff, done_cutoff)
-            )).rowcount
-            deleted_stars = (await ex("DELETE FROM stars_payments WHERE created_at < ?", (stars_cutoff,))).rowcount
-            deleted_used = (await ex(
-                "DELETE FROM used_promos WHERE code NOT IN (SELECT code FROM promo_codes)"
-            )).rowcount
-
-            cleanup_memory_state()
-
-            if deleted_logs or deleted_notifs or deleted_tickets or deleted_tx or deleted_stars or deleted_used:
-                logging.info(
-                    f"🧹 Автоочистка БД: admin_logs -{deleted_logs}, notifications -{deleted_notifs}, "
-                    f"тикетов -{deleted_tickets}, транзакций Platega -{deleted_tx}, "
-                    f"Stars -{deleted_stars}, used_promos -{deleted_used}"
-                )
-        except Exception as e:
-            logging.error(f"Ошибка автоочистки БД: {e}")
-        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-
-async def set_commands():
-    commands = [
-        BotCommand(command="start", description="🚀 Запустить бота"),
-        BotCommand(command="help", description="❓ Помощь и Поддержка"),
-        BotCommand(command="about", description="👨‍💻 О создателях")
-    ]
-    await bot.set_my_commands(commands)
-
-@dp.error()
-async def error_handler(event: ErrorEvent):
-    exception = event.exception
-    logging.error("Необработанная ошибка:\n" + "".join(
-        traceback.format_exception(type(exception), exception, exception.__traceback__)
-    ))
-    try:
-        if event.update and event.update.message:
-            await event.update.message.answer("⚠️ Произошла ошибка, попробуйте ещё раз /start")
-    except Exception:
-        pass
-    return True
-
-############################################################
-# WEB SERVER FOR RENDER HEALTH CHECK
-############################################################
-
-async def handle_ping(request):
-    return web.Response(text="Bot is running", status=200)
-
-async def handle_platega_callback(request):
-    # Callback от Platega.io. Подлинность — по заголовкам X-MerchantId/X-Secret
-    # (сравнение за постоянное время). Платёж начисляется РОВНО один раз: переход
-    # PENDING -> PROCESSING делается одним атомарным UPDATE, поэтому повторные и
-    # параллельные callback'и ничего не начислят. Если начисление упало —
-    # статус возвращается в PENDING и отвечаем 500, Platega повторит запрос.
-    try:
-        merchant_header = request.headers.get("X-MerchantId", "")
-        secret_header = request.headers.get("X-Secret", "")
-        if (not platega_client.is_configured()
-                or not hmac.compare_digest(merchant_header, platega_client.merchant_id)
-                or not hmac.compare_digest(secret_header, platega_client.secret)):
-            logging.warning("Platega callback: неверные X-MerchantId/X-Secret")
-            return web.Response(status=401, text="unauthorized")
-
-        data = await request.json()
-    except Exception as e:
-        logging.error(f"Platega callback: не удалось разобрать тело запроса: {e}")
-        return web.Response(status=400, text="bad request")
-
-    transaction_id = data.get("id") if isinstance(data, dict) else None
-    status = str(data.get("status", "")).upper() if isinstance(data, dict) else ""
-    if not transaction_id or not status:
-        return web.Response(status=400, text="missing id/status")
-
-    tx = await asyncio.to_thread(db.get_platega_transaction, transaction_id)
-    if not tx:
-        logging.warning(f"Platega callback: неизвестная транзакция {transaction_id}")
-        return web.Response(status=200, text="ok")
-
-    if status == "CONFIRMED":
-        claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "PENDING", "PROCESSING")
-        if not claimed:
-            return web.Response(status=200, text="ok")  # уже обработана
-        tx_user_id, tx_tariff_id = claimed[0], claimed[1]
-        try:
-            result = await activate_subscription(tx_user_id, tx_tariff_id)
-        except Exception as e:
-            logging.error(f"Platega: ошибка начисления {transaction_id}: {e}")
-            await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "PENDING")
-            return web.Response(status=500, text="retry")
-
-        if not result:
-            await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "FAILED")
-            logging.error(f"Platega: не удалось начислить {transaction_id} (user {tx_user_id}, тариф {tx_tariff_id})")
-            try:
-                await bot.send_message(OWNER_ID, f"⚠️ Platega-оплата не начислена: user {tx_user_id}, тариф {tx_tariff_id}, tx {transaction_id}")
-            except Exception:
-                pass
-            return web.Response(status=200, text="ok")
-
-        await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "CONFIRMED")
-        days, new_expire_str = result
-        try:
-            await bot.send_message(
-                tx_user_id,
-                f"🎉 <b>Оплата прошла успешно!</b>\n\n"
-                f"Вам добавлено <b>+{days} дней</b> подписки.\n"
-                f"Подписка активна до: <b>{new_expire_str}</b>",
-                reply_markup=back_keyboard()
-            )
-        except Exception:
-            pass
-
-    elif status == "CANCELED":
-        claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "PENDING", "CANCELED")
-        if claimed:
-            try:
-                await bot.send_message(claimed[0], PAY_FAILED_TEXT, reply_markup=pay_failed_keyboard())
-            except Exception:
-                pass
-
-    elif status == "CHARGEBACKED":
-        claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "CONFIRMED", "CHARGEBACKED")
-        if claimed:
-            try:
-                await bot.send_message(OWNER_ID, f"⚠️ Chargeback по Platega: user {claimed[0]}, тариф {claimed[1]}, tx {transaction_id}. Доступ автоматически не снят.")
-            except Exception:
-                pass
-    # Прочие/промежуточные статусы игнорируем — статус в БД остаётся PENDING.
-
-    return web.Response(status=200, text="ok")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_ping)
-    app.router.add_get('/ping', handle_ping)
-    app.router.add_post('/platega/webhook', handle_platega_callback)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logging.info(f"🌐 Веб-сервер запущен на порту {PORT}")
-
-############################################################
-# START BOT
-############################################################
-
-async def main():
-    global BOT_USERNAME
-    logging.info("🚀 Запуск Stopka VPN...")
-
-    bot_info = await bot.get_me()
-    BOT_USERNAME = bot_info.username
-
-    # Независимые задачи запуска — параллельно, а не одна за другой
-    await asyncio.gather(
-        set_commands(),
-        start_web_server(),
-        bot.delete_webhook(drop_pending_updates=True)
-    )
-
-    asyncio.create_task(subscription_checker())
-    asyncio.create_task(db_cleanup_task())
-    asyncio.create_task(platega_status_checker())
-
-    logging.info("✅ Stopka VPN запущен успешно!")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await vpn_client.close()
-        await platega_client.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyn
