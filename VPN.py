@@ -2603,4 +2603,240 @@ def cleanup_memory_state():
     for uid in [u for u, lock in user_locks.items() if not lock.locked()]:
         user_locks.pop(uid, None)
 
-asyn
+async def db_cleanup_task():
+    """Автоочистка накопительных данных, чтобы БД (Neon) не забивалась.
+    - admin_logs, notifications: старше LOGS_RETENTION_DAYS.
+    - tickets: только ЗАКРЫТЫЕ старше CLOSED_TICKETS_RETENTION_DAYS (вместе с текстом,
+      ответом и file_id). Открытые не удаляются никогда. Закрытые без даты закрытия
+      (старые записи) получают дату сегодня и уйдут по сроку.
+    - platega_transactions: отменённые/неоплаченные старше 7 дней; оплаченные — старше 180.
+      Зависшие PROCESSING (сбой во время начисления) возвращаются в PENDING.
+    - stars_payments: старше 180 дней.
+    - used_promos: записи о промокодах, которых уже нет в promo_codes.
+    users, promo_codes, referrals — не трогаются."""
+    while True:
+        try:
+            now = datetime.now()
+            fmt = "%Y-%m-%d %H:%M:%S"
+            log_cutoff = (now - timedelta(days=LOGS_RETENTION_DAYS)).strftime(fmt)
+            ticket_cutoff = (now - timedelta(days=CLOSED_TICKETS_RETENTION_DAYS)).strftime(fmt)
+            dead_cutoff = (now - timedelta(days=PLATEGA_DEAD_RETENTION_DAYS)).isoformat()
+            done_cutoff = (now - timedelta(days=PLATEGA_DONE_RETENTION_DAYS)).isoformat()
+            stars_cutoff = (now - timedelta(days=STARS_RETENTION_DAYS)).isoformat()
+            ex = lambda q, p=(): asyncio.to_thread(db.conn.execute, q, p)
+
+            deleted_logs = (await ex("DELETE FROM admin_logs WHERE created_at < ?", (log_cutoff,))).rowcount
+            deleted_notifs = (await ex("DELETE FROM notifications WHERE date < ?", (log_cutoff[:10],))).rowcount
+
+            await ex("UPDATE tickets SET closed_at=? WHERE status='Закрыт' AND (closed_at IS NULL OR closed_at='')", (now.strftime(fmt),))
+            deleted_tickets = (await ex(
+                "DELETE FROM tickets WHERE status='Закрыт' AND closed_at != '' AND closed_at < ?", (ticket_cutoff,)
+            )).rowcount
+
+            await ex(
+                "UPDATE platega_transactions SET status='PENDING' WHERE status='PROCESSING' AND created_at < ?",
+                ((now - timedelta(days=1)).isoformat(),)
+            )
+            deleted_tx = (await ex(
+                "DELETE FROM platega_transactions WHERE "
+                "(status NOT IN ('CONFIRMED','CHARGEBACKED','PROCESSING') AND created_at < ?) OR "
+                "(status IN ('CONFIRMED','CHARGEBACKED') AND created_at < ?)",
+                (dead_cutoff, done_cutoff)
+            )).rowcount
+            deleted_stars = (await ex("DELETE FROM stars_payments WHERE created_at < ?", (stars_cutoff,))).rowcount
+            deleted_used = (await ex(
+                "DELETE FROM used_promos WHERE code NOT IN (SELECT code FROM promo_codes)"
+            )).rowcount
+
+            cleanup_memory_state()
+
+            if deleted_logs or deleted_notifs or deleted_tickets or deleted_tx or deleted_stars or deleted_used:
+                logging.info(
+                    f"🧹 Автоочистка БД: admin_logs -{deleted_logs}, notifications -{deleted_notifs}, "
+                    f"тикетов -{deleted_tickets}, транзакций Platega -{deleted_tx}, "
+                    f"Stars -{deleted_stars}, used_promos -{deleted_used}"
+                )
+        except Exception as e:
+            logging.error(f"Ошибка автоочистки БД: {e}")
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+async def set_commands():
+    commands = [
+        BotCommand(command="start", description="🚀 Запустить бота"),
+        BotCommand(command="help", description="❓ Помощь и Поддержка"),
+        BotCommand(command="about", description="👨‍💻 О создателях")
+    ]
+    await bot.set_my_commands(commands)
+
+@dp.error()
+async def error_handler(event: ErrorEvent):
+    exception = event.exception
+    logging.error("Необработанная ошибка:\n" + "".join(
+        traceback.format_exception(type(exception), exception, exception.__traceback__)
+    ))
+    try:
+        if event.update and event.update.message:
+            await event.update.message.answer("⚠️ Произошла ошибка, попробуйте ещё раз /start")
+    except Exception:
+        pass
+    return True
+
+############################################################
+# WEB SERVER FOR RENDER HEALTH CHECK
+############################################################
+
+_bg_tasks = set()
+
+def _spawn(coro):
+    """Запускает фоновую задачу и держит на неё ссылку (иначе её может собрать GC)."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+async def finalize_platega_confirmed(transaction_id: str):
+    """Начисляет оплаченную транзакцию Platega РОВНО один раз. Вызывается и из webhook'а,
+    и из опроса статуса — что сработает первым, то и начислит: переход PENDING ->
+    PROCESSING делается одним атомарным UPDATE, второй вызов получит None и выйдет.
+    Если начисление упало — статус возвращается в PENDING, и опрос Platega повторит его."""
+    try:
+        claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "PENDING", "PROCESSING")
+        if not claimed:
+            return  # уже обработана (или обрабатывается)
+        tx_user_id, tx_tariff_id = claimed[0], claimed[1]
+        try:
+            result = await activate_subscription(tx_user_id, tx_tariff_id)
+        except Exception as e:
+            logging.error(f"Platega: ошибка начисления {transaction_id}: {e}")
+            await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "PENDING")
+            return
+
+        if not result:
+            await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "FAILED")
+            logging.error(f"Platega: не удалось начислить {transaction_id} (user {tx_user_id}, тариф {tx_tariff_id})")
+            try:
+                await bot.send_message(OWNER_ID, f"⚠️ Platega-оплата не начислена: user {tx_user_id}, тариф {tx_tariff_id}, tx {transaction_id}")
+            except Exception:
+                pass
+            return
+
+        await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "CONFIRMED")
+        logging.info(f"Platega: оплата {transaction_id} начислена (user {tx_user_id}, тариф {tx_tariff_id})")
+        days, new_expire_str = result
+        try:
+            await bot.send_message(
+                tx_user_id,
+                f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+                f"Вам добавлено <b>+{days} дней</b> подписки.\n"
+                f"Подписка активна до: <b>{new_expire_str}</b>",
+                reply_markup=back_keyboard()
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logging.error(f"Platega: сбой финализации {transaction_id}: {e}")
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running", status=200)
+
+async def handle_platega_callback(request):
+    # Callback от Platega.io. Подлинность — по заголовкам X-MerchantId/X-Secret
+    # (сравнение за постоянное время). Платёж начисляется РОВНО один раз: переход
+    # PENDING -> PROCESSING делается одним атомарным UPDATE, поэтому повторные и
+    # параллельные callback'и ничего не начислят. Само начисление идёт в фоне
+    # (finalize_platega_confirmed), а Platega отвечаем сразу; если начисление упало —
+    # статус возвращается в PENDING, и платёж добивает опрос platega_status_checker.
+    try:
+        merchant_header = request.headers.get("X-MerchantId", "")
+        secret_header = request.headers.get("X-Secret", "")
+        if (not platega_client.is_configured()
+                or not hmac.compare_digest(merchant_header, platega_client.merchant_id)
+                or not hmac.compare_digest(secret_header, platega_client.secret)):
+            logging.warning("Platega callback: неверные X-MerchantId/X-Secret")
+            return web.Response(status=401, text="unauthorized")
+
+        data = await request.json()
+    except Exception as e:
+        logging.error(f"Platega callback: не удалось разобрать тело запроса: {e}")
+        return web.Response(status=400, text="bad request")
+
+    transaction_id = data.get("id") if isinstance(data, dict) else None
+    status = str(data.get("status", "")).upper() if isinstance(data, dict) else ""
+    if not transaction_id or not status:
+        return web.Response(status=400, text="missing id/status")
+
+    tx = await asyncio.to_thread(db.get_platega_transaction, transaction_id)
+    if not tx:
+        logging.warning(f"Platega callback: неизвестная транзакция {transaction_id}")
+        return web.Response(status=200, text="ok")
+
+    if status == "CONFIRMED":
+        # Platega ждёт ответа на callback считанные секунды, а начисление ходит в БД, на панель
+        # 3x-ui и в Telegram — при любой задержке Platega считал бы callback недоставленным.
+        # Поэтому отвечаем сразу, а начисляем в фоне; если начисление упадёт, статус вернётся
+        # в PENDING, и платёж добьёт опрос Platega (platega_status_checker).
+        _spawn(finalize_platega_confirmed(transaction_id))
+
+    elif status == "CANCELED":
+        claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "PENDING", "CANCELED")
+        if claimed:
+            try:
+                await bot.send_message(claimed[0], PAY_FAILED_TEXT, reply_markup=pay_failed_keyboard())
+            except Exception:
+                pass
+
+    elif status == "CHARGEBACKED":
+        claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "CONFIRMED", "CHARGEBACKED")
+        if claimed:
+            try:
+                await bot.send_message(OWNER_ID, f"⚠️ Chargeback по Platega: user {claimed[0]}, тариф {claimed[1]}, tx {transaction_id}. Доступ автоматически не снят.")
+            except Exception:
+                pass
+    # Прочие/промежуточные статусы игнорируем — статус в БД остаётся PENDING.
+
+    return web.Response(status=200, text="ok")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    app.router.add_get('/ping', handle_ping)
+    app.router.add_post('/platega/webhook', handle_platega_callback)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logging.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+
+############################################################
+# START BOT
+############################################################
+
+async def main():
+    global BOT_USERNAME
+    logging.info("🚀 Запуск Stopka VPN...")
+
+    bot_info = await bot.get_me()
+    BOT_USERNAME = bot_info.username
+
+    # Независимые задачи запуска — параллельно, а не одна за другой
+    await asyncio.gather(
+        set_commands(),
+        start_web_server(),
+        bot.delete_webhook(drop_pending_updates=True)
+    )
+
+    asyncio.create_task(subscription_checker())
+    asyncio.create_task(db_cleanup_task())
+    asyncio.create_task(platega_status_checker())
+    asyncio.create_task(panel_resync_task())
+
+    logging.info("✅ Stopka VPN запущен успешно!")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await vpn_client.close()
+        await platega_client.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
