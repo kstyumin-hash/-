@@ -57,7 +57,8 @@ VPN_API_URL = os.environ.get("VPN_API_URL", "https://your-vpn-panel.com")
 VPN_ADMIN_USERNAME = os.environ.get("VPN_ADMIN_USERNAME", "admin")
 VPN_ADMIN_PASSWORD = os.environ.get("VPN_ADMIN_PASSWORD", "password")
 
-REFERRAL_DAYS = 7
+REFERRAL_DAYS = 7          # приглашающему — сразу, как только друг впервые перешёл по ссылке
+REFERRED_BONUS_DAYS = 3    # приглашённому — подарок за вход по ссылке (к пробному периоду); 0 — выключить
 
 ############################################################
 # ЛОГИ
@@ -944,6 +945,16 @@ class Database:
         )
         return cursor.fetchone()[0]
 
+    def get_referral_stats(self, user_id):
+        """(приглашено, из них оплатили и принесли бонус)"""
+        cursor = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN bonus_given=1 THEN 1 ELSE 0 END), 0) "
+            "FROM referrals WHERE invited_by=?",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        return int(row[0] or 0), int(row[1] or 0)
+
     def get_total_users_count(self):
         cursor = self.conn.execute("SELECT COUNT(*) FROM users")
         return cursor.fetchone()[0]
@@ -1033,6 +1044,16 @@ TARIFFS = {
 ############################################################
 
 TRIAL_DAYS = 3
+
+def _days_word(n):
+    n = abs(int(n))
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    if n % 10 == 1:
+        return "день"
+    if 2 <= n % 10 <= 4:
+        return "дня"
+    return "дней"
 RUB_PER_DAY = 5  # декоративный курс для профиля: показывается как {дни}×5₽, без реального смысла
 
 ############################################################
@@ -1347,6 +1368,8 @@ async def start(message: Message):
 
     # Сериализуем обработку по user_id — см. комментарий у user_locks выше.
     async with user_locks[user_id]:
+        is_new_user = False
+        referred_now = False
         user = await asyncio.to_thread(db.get_user, user_id)
         if user:
             if (user[1] or "") != username:
@@ -1356,6 +1379,7 @@ async def start(message: Message):
             # Новый пользователь — add_user делает один INSERT...RETURNING и
             # сразу отдаёт готовую строку, без отдельных SELECT до и после.
             user = await asyncio.to_thread(db.add_user, user_id, username, message.from_user.full_name)
+            is_new_user = user is not None   # строку создали именно мы, прямо сейчас — человек пришёл впервые
             if user is None:
                 # Редкая гонка: кто-то другой успел создать эту же строку
                 # между нашей проверкой и INSERT — просто дочитываем её.
@@ -1368,19 +1392,28 @@ async def start(message: Message):
         if len(args) > 1:
             ref = args[1]
             if ref.startswith("STOPKA"):
+                # Реферальная ссылка работает ТОЛЬКО при самом первом /start человека в боте:
+                # уже зарегистрированные (в т.ч. сам владелец ссылки и тот, кто уже переходил
+                # по ссылке) бонус не принесут — повторно по ссылке зайти нельзя.
                 try:
-                    inviter = int(ref.replace("STOPKA", ""))
-                    if inviter != user_id:
+                    inviter = int(ref[len("STOPKA"):])
+                    if (is_new_user and inviter != user_id
+                            and await asyncio.to_thread(db.get_user, inviter)):
                         # invited_by=0 проверяется прямо в WHERE самого UPDATE (атомарно),
                         # а не отдельным SELECT заранее — исключает гонку при двойном /start.
                         bind_cur = await asyncio.to_thread(
                             db.conn.execute,
-                            "UPDATE users SET invited_by=? WHERE id=? AND invited_by=0",
+                            "UPDATE users SET invited_by=? WHERE id=? AND (invited_by=0 OR invited_by IS NULL)",
                             (inviter, user_id)
                         )
                         if bind_cur.rowcount == 1:
-                            await asyncio.to_thread(db.conn.execute, "INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES(?,?,0) ON CONFLICT (user_id) DO NOTHING", (user_id, inviter))
-                            await asyncio.to_thread(db.conn.commit)
+                            referred_now = True
+                            logging.info(f"Реферал: {user_id} впервые перешёл по ссылке {inviter}")
+                            # Бонус приглашающему — отдельной задачей, уже ПОСЛЕ освобождения лока
+                            # этого пользователя: берём лок приглашающего, и если бы два человека
+                            # одновременно приглашали друг друга, держа каждый свой лок, получился бы
+                            # взаимный дедлок.
+                            _spawn(_process_referral_join(user_id, inviter))
                 except Exception as e:
                     logging.error(f"Ошибка обработки реферала: {e}")
 
@@ -1401,7 +1434,11 @@ async def start(message: Message):
                 f"по имени колонки (accepted_terms, trial_used)=({accepted_flag}, {trial_used_flag}), "
                 f"raw row len={len(user)}"
             )
-            await message.answer(WELCOME_TEXT, reply_markup=welcome_keyboard())
+            welcome = WELCOME_TEXT
+            if REFERRED_BONUS_DAYS > 0 and (referred_now or (user is not None and user[6])):
+                welcome += (f"\n\n🎁 Вы пришли по приглашению друга — получите ещё "
+                            f"<b>+{REFERRED_BONUS_DAYS} {_days_word(REFERRED_BONUS_DAYS)}</b> VPN в подарок.")
+            await message.answer(welcome, reply_markup=welcome_keyboard())
             return
 
         await render_profile(user_id, target_message=message, user=user)
@@ -1470,7 +1507,11 @@ async def accept_terms(callback: CallbackQuery):
         # нестабильная сеть и т.п.), только ОДИН из двух запросов реально
         # обновит строку и получит trial_used=0->1, второй увидит rowcount=0
         # и не выдаст дни повторно.
-        expire = datetime.now() + timedelta(days=TRIAL_DAYS)
+        # Пришёл по реферальной ссылке — к пробному периоду добавляется подарок за вход
+        user0 = await asyncio.to_thread(db.get_user, user_id)
+        referred = REFERRED_BONUS_DAYS > 0 and bool(user0 and user0[6])
+        trial_days = TRIAL_DAYS + (REFERRED_BONUS_DAYS if referred else 0)
+        expire = datetime.now() + timedelta(days=trial_days)
         expire_str = expire.strftime("%Y-%m-%d 23:59:59")
         cur = await asyncio.to_thread(
             db.conn.execute,
@@ -1479,7 +1520,9 @@ async def accept_terms(callback: CallbackQuery):
             (expire_str, user_id)
         )
         if cur.rowcount == 1:
-            alert_text = f"🎉 Вам начислено {TRIAL_DAYS} дня VPN!"
+            alert_text = f"🎉 Вам начислено {trial_days} {_days_word(trial_days)} VPN!"
+            if referred:
+                alert_text += f"\n(включая +{REFERRED_BONUS_DAYS} {_days_word(REFERRED_BONUS_DAYS)} за приглашение)"
             logging.info(f"accept_terms: user_id={user_id} — пробный период выдан, trial_used выставлен в 1 (rowcount=1)")
         else:
             # Пробный период уже был использован раньше (или гонка — его только что
@@ -1799,42 +1842,77 @@ async def panel_resync_task():
                         await bot.send_message(OWNER_ID, f"✅ Ключ {uid} успешно обновлён на панели 3x-ui при повторной попытке.")
                     except Exception:
                         pass
+            await _retry_referral_bonuses()
         except Exception as e:
             logging.error(f"Ошибка panel_resync_task: {e}")
         await asyncio.sleep(60)
 
+_referral_retry = {}   # user_id (приглашённый) -> inviter_id: бонус не удалось начислить, повторим
+
+async def _process_referral_join(user_id: int, inviter_id: int):
+    """Друг впервые перешёл по ссылке — приглашающий получает бонус сразу. Если начисление
+    не удалось (сбой БД) — фоновая задача повторит."""
+    try:
+        await _grant_referral_bonus(user_id, inviter_id)
+    except Exception as e:
+        logging.error(f"Реферал: не удалось начислить бонус {inviter_id} за {user_id}: {e}")
+        _referral_retry[user_id] = inviter_id
+
 async def _grant_referral_bonus(user_id: int, inviter_id: int):
+    """Начисляет приглашающему +REFERRAL_DAYS дней — ровно один раз за приглашённого.
+    Отметка «бонус выдан» ставится одним атомарным запросом (INSERT ... ON CONFLICT DO UPDATE):
+    строка в referrals создастся, даже если её по какой-то причине не оказалось при привязке.
+    Если само начисление упало — отметка снимается, и бонус начислится при повторной попытке."""
     async with user_locks[inviter_id]:
+        inviter = await asyncio.to_thread(db.get_user, inviter_id)
         row = (await asyncio.to_thread(
             db.conn.execute,
-            "UPDATE referrals SET bonus_given=1 WHERE user_id=? AND bonus_given=0 RETURNING user_id",
-            (user_id,)
+            "INSERT INTO referrals (user_id, invited_by, bonus_given) VALUES (?,?,1) "
+            "ON CONFLICT (user_id) DO UPDATE SET bonus_given=1 WHERE referrals.bonus_given=0 "
+            "RETURNING user_id",
+            (user_id, inviter_id)
         )).fetchone()
         if not row:
-            return
-        inviter = await asyncio.to_thread(db.get_user, inviter_id)
+            return  # уже начислено раньше
         if not inviter:
+            logging.warning(f"Реферал: приглашающий {inviter_id} не найден, бонус за {user_id} не начислен")
             return
         try:
-            inv_expire = datetime.strptime(inviter[3], "%Y-%m-%d %H:%M:%S")
+            try:
+                inv_expire = datetime.strptime(inviter[3], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                inv_expire = datetime.now()
+            if inv_expire < datetime.now():
+                inv_expire = datetime.now()
+            inv_new_expire = _end_of_day(inv_expire + timedelta(days=REFERRAL_DAYS))
+            await asyncio.to_thread(
+                db.conn.execute,
+                "UPDATE users SET expire_date=?, status='Активно' WHERE id=?",
+                (inv_new_expire.strftime("%Y-%m-%d %H:%M:%S"), inviter_id)
+            )
         except Exception:
-            inv_expire = datetime.now()
-        if inv_expire < datetime.now():
-            inv_expire = datetime.now()
-        inv_new_expire = _end_of_day(inv_expire + timedelta(days=REFERRAL_DAYS))
-        await asyncio.to_thread(
-            db.conn.execute,
-            "UPDATE users SET expire_date=?, status='Активно' WHERE id=?",
-            (inv_new_expire.strftime("%Y-%m-%d %H:%M:%S"), inviter_id)
-        )
+            # Дни не начислены — снимаем отметку, чтобы попытка могла повториться
+            await asyncio.to_thread(
+                db.conn.execute, "UPDATE referrals SET bonus_given=0 WHERE user_id=?", (user_id,)
+            )
+            raise
         await _sync_panel(inviter_id, inv_new_expire)
+    logging.info(f"Реферал: {inviter_id} получил +{REFERRAL_DAYS} дн. за приглашённого {user_id}")
     try:
         await bot.send_message(
             inviter_id,
-            f"🎁 Ваш друг оформил подписку по вашей ссылке!\nВам начислено +{REFERRAL_DAYS} дней VPN."
+            f"🎁 По вашей ссылке пришёл друг!\nВам начислено +{REFERRAL_DAYS} {_days_word(REFERRAL_DAYS)} VPN."
         )
     except Exception:
         pass
+
+async def _retry_referral_bonuses():
+    for uid, inviter_id in list(_referral_retry.items()):
+        try:
+            await _grant_referral_bonus(uid, inviter_id)
+            _referral_retry.pop(uid, None)
+        except Exception as e:
+            logging.error(f"Повтор реферального бонуса ({uid} -> {inviter_id}) не удался: {e}")
 
 async def activate_subscription(user_id: int, tariff_id: str):
     """Продлевает подписку на days тарифа, обновляет ключ на 3x-ui, начисляет
@@ -1882,6 +1960,7 @@ async def activate_subscription(user_id: int, tariff_id: str):
             await _grant_referral_bonus(user_id, inviter_id)
         except Exception as e:
             logging.error(f"Ошибка реферального бонуса ({user_id} -> {inviter_id}): {e}")
+            _referral_retry[user_id] = inviter_id   # повторит фоновая задача
 
     return days, new_expire_str
 
@@ -2003,13 +2082,14 @@ async def my_ref(callback: CallbackQuery):
         bot_info = await bot.get_me()
         BOT_USERNAME = bot_info.username
     link = f"https://t.me/{BOT_USERNAME}?start=STOPKA{callback.from_user.id}"
-    ref_count = await asyncio.to_thread(db.get_referral_count, callback.from_user.id)
+    invited, _paid = await asyncio.to_thread(db.get_referral_stats, callback.from_user.id)
     await callback.message.edit_text(
         f"🎁 <b>Реферальная программа</b>\n\n"
         f"Приглашай друзей и получай бонусные дни VPN.\n\n"
         f"🔗 Твоя ссылка:\n<code>{link}</code>\n\n"
-        f"👥 Приглашено друзей: <b>{ref_count}</b>\n"
-        f"⭐ За каждого друга: +{REFERRAL_DAYS} дней VPN",
+        f"👥 Приглашено друзей: <b>{invited}</b>\n"
+        f"⭐ За каждого друга, который впервые зашёл в бота по твоей ссылке: +{REFERRAL_DAYS} {_days_word(REFERRAL_DAYS)} VPN "
+        f"— начисляются сразу, без оплаты. Друг тоже получает +{REFERRED_BONUS_DAYS} {_days_word(REFERRED_BONUS_DAYS)} в подарок.",
         reply_markup=back_keyboard()
     )
     await callback.answer()
