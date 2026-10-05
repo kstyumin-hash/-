@@ -121,11 +121,20 @@ class VPNClient:
         self.device_limit = int(os.environ.get("THREEXUI_DEVICE_LIMIT", "5"))
         self.sub_port = os.environ.get("THREEXUI_SUB_PORT", "")
         self.sub_path = os.environ.get("THREEXUI_SUB_PATH", "sub").strip("/")
+        self.last_error = ""        # причина последнего отказа панели — попадает в уведомление владельцу
         self._session = None
         self._logged_in = False
         self._login_gen = 0        # растёт после каждого успешного логина
         self._login_lock = None    # локи создаются лениво — уже внутри event loop
         self._write_lock = None
+
+    def is_configured(self):
+        """Панель подключена, если адрес/логин/пароль заданы в окружении и это не
+        значения-заглушки по умолчанию. Пока панель не подключена, бот работает без неё."""
+        return bool(
+            self.base_url and self.username and self.password
+            and "your-vpn-panel.com" not in self.base_url
+        )
 
     def _init_locks(self):
         if self._login_lock is None:
@@ -228,10 +237,13 @@ class VPNClient:
                 status, data = await self._request("POST", path, json=payload)
         except PanelError as e:
             logging.error(f"Ошибка запроса к 3x-ui: {e}")
+            self.last_error = str(e)
             return False
         ok = status == 200 and isinstance(data, dict) and bool(data.get("success", False))
         if not ok:
             logging.error(f"3x-ui {path}: отказ (HTTP {status}): {data}")
+            msg = data.get("msg") if isinstance(data, dict) else data
+            self.last_error = f"панель отказала (HTTP {status}): {msg}"
         return ok
 
     async def _find_existing_client(self, email):
@@ -285,6 +297,7 @@ class VPNClient:
             existing = await self._find_existing_client(email)
         except PanelError as e:
             logging.error(f"3x-ui: не удалось проверить клиента {email}: {e}")
+            self.last_error = f"не удалось проверить клиента: {e}"
             return ""
 
         if not existing:
@@ -316,6 +329,7 @@ class VPNClient:
     async def create_or_update_user(self, user_id, expire_timestamp):
         self._init_locks()
         async with self._write_lock:
+            self.last_error = ""
             return await self._create_or_update_locked(user_id, expire_timestamp)
 
     async def disable_user(self, user_id):
@@ -1362,7 +1376,8 @@ async def render_profile(user_id, target_message=None, callback=None, user=None)
 ############################################################
 
 @dp.message(Command("start"))
-async def start(message: Message):
+async def start(message: Message, state: FSMContext):
+    await state.clear()   # выход из любого режима ввода (промокод, обращение и т.д.)
     user_id = message.from_user.id
     username = message.from_user.username or ""
 
@@ -1444,7 +1459,8 @@ async def start(message: Message):
         await render_profile(user_id, target_message=message, user=user)
 
 @dp.message(Command("help"))
-async def help_command(message: Message):
+async def help_command(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "🛡 <b>Поддержка Stopka VPN</b>\n\n"
         "Не переживайте — если что-то пошло не так, мы обязательно разберёмся и поможем 🤝\n\n"
@@ -1454,7 +1470,8 @@ async def help_command(message: Message):
     )
 
 @dp.message(Command("about"))
-async def about_command(message: Message):
+async def about_command(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         '<a href="https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-09-02-81">ПОЛИТИКА КОНФИДЕНЦИАЛЬНОСТИ</a>\n\n'
         '<a href="https://telegra.ph/USLOVIYA-POLZOVANIYA-09-02-2">УСЛОВИЯ ПОЛЬЗОВАНИЯ</a>\n\n'
@@ -1796,13 +1813,20 @@ def _end_of_day(dt):
     чтобы ключ не отключался раньше, чем показывает бот."""
     return dt.replace(hour=23, minute=59, second=59, microsecond=0)
 
+_last_panel_alert = 0.0
 _panel_resync = {}   # user_id -> expire_dt: срок, который не удалось записать на панель
 
-async def _sync_panel(user_id: int, expire_dt) -> bool:
+async def _sync_panel(user_id: int, expire_dt, reason: str = "payment") -> bool:
     """Обновляет срок ключа на панели. create_or_update_user при сбое возвращает
     пустую строку (а не исключение). Повторы при временных сбоях сети/панели делает
     сам клиент 3x-ui; если панель недоступна дольше — срок встаёт в очередь
     _panel_resync, и panel_resync_task дозапишет его автоматически."""
+    if not vpn_client.is_configured():
+        # Панель 3x-ui ещё не подключена — дни в базе бота начислены, ключ синхронизировать некуда.
+        # Никаких ошибок и уведомлений: как только панель подключат (переменные окружения),
+        # всё заработает само.
+        logging.info(f"Панель 3x-ui не подключена — синхронизация {user_id} пропущена")
+        return True
     try:
         res = await vpn_client.create_or_update_user(user_id, int(expire_dt.timestamp()))
         if res:
@@ -1812,8 +1836,21 @@ async def _sync_panel(user_id: int, expire_dt) -> bool:
     except Exception as e:
         logging.error(f"Ошибка синхронизации с панелью для {user_id}: {e}")
     _panel_resync[user_id] = expire_dt
+    # Не заваливаем владельца: при долгом сбое панели — не чаще одного уведомления в 30 минут
+    # (все такие сроки всё равно стоят в очереди и дозапишутся сами).
+    global _last_panel_alert
+    if time.time() - _last_panel_alert < 1800:
+        return False
+    _last_panel_alert = time.time()
+    what = {"payment": "Оплата прошла", "referral": "Реферальный бонус начислен", "promo": "Промокод активирован"}.get(reason, "Дни начислены")
+    why = getattr(vpn_client, "last_error", "")
     try:
-        await bot.send_message(OWNER_ID, f"⚠️ Оплата прошла, но ключ {user_id} не обновился на панели 3x-ui (срок до {expire_dt:%Y-%m-%d}). Бот будет повторять попытку каждую минуту и напишет, когда получится.")
+        await bot.send_message(
+            OWNER_ID,
+            f"⚠️ {what}, но ключ {user_id} не обновился на панели 3x-ui (срок до {expire_dt:%Y-%m-%d}).\n"
+            + (f"Причина: {why[:300]}\n" if why else "")
+            + "Бот будет повторять попытку каждую минуту и напишет, когда получится."
+        )
     except Exception:
         pass
     return False
@@ -1824,6 +1861,8 @@ async def panel_resync_task():
     await asyncio.sleep(30)
     while True:
         try:
+            if not vpn_client.is_configured():
+                _panel_resync.clear()
             for uid in list(_panel_resync.keys()):
                 async with user_locks[uid]:
                     exp = _panel_resync.get(uid)  # перечитываем: за время ожидания лока срок мог обновиться
@@ -1896,7 +1935,7 @@ async def _grant_referral_bonus(user_id: int, inviter_id: int):
                 db.conn.execute, "UPDATE referrals SET bonus_given=0 WHERE user_id=?", (user_id,)
             )
             raise
-        await _sync_panel(inviter_id, inv_new_expire)
+        await _sync_panel(inviter_id, inv_new_expire, reason="referral")
     logging.info(f"Реферал: {inviter_id} получил +{REFERRAL_DAYS} дн. за приглашённого {user_id}")
     try:
         await bot.send_message(
@@ -2094,72 +2133,126 @@ async def my_ref(callback: CallbackQuery):
     )
     await callback.answer()
 
+PROMO_WRONG_COOLDOWN = 5      # сек паузы после неверного промокода
+_promo_wrong_until = {}       # user_id -> time.monotonic(), до которого нельзя пробовать снова
+
 @dp.callback_query(F.data == "promo")
 async def promo_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(PromoState.waiting_code)
     await callback.message.edit_text(
         "🎟 <b>Введите промокод</b>\n\n"
-        "Отправьте промокод сообщением:",
+        "Отправьте промокод сообщением. Если ошиблись — просто отправьте ещё раз.\n"
+        "Чтобы выйти, нажмите «Назад» (или отправьте /start, /help, /about).",
         reply_markup=back_keyboard()
     )
     await callback.answer()
 
+async def _activate_promo(user_id: int, code: str):
+    """Пытается активировать промокод. Возвращает (статус, данные):
+    ("ok", (days, new_expire)) | "used" | "notfound" | "limit" | "nouser"."""
+    if await asyncio.to_thread(db.is_promo_used, user_id, code):
+        return "used", None
+    promo = (await asyncio.to_thread(db.conn.execute, "SELECT 1 FROM promo_codes WHERE code=?", (code,))).fetchone()
+    if not promo:
+        return "notfound", None
+    # Место под использование занимаем одним атомарным UPDATE — иначе два человека одновременно
+    # могли бы обойти лимит использований.
+    claimed = (await asyncio.to_thread(
+        db.conn.execute,
+        "UPDATE promo_codes SET uses=uses+1 WHERE code=? AND uses<max_uses RETURNING days",
+        (code,)
+    )).fetchone()
+    if not claimed:
+        return "limit", None
+    days = claimed[0]
+    try:
+        user = await asyncio.to_thread(db.get_user, user_id)
+        if not user:
+            raise LookupError("user not found")
+        try:
+            expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            expire = datetime.now()
+        now = datetime.now()
+        if expire < now:
+            expire = now
+        new_expire = expire + timedelta(days=days)
+        await asyncio.to_thread(
+            db.conn.execute,
+            "UPDATE users SET expire_date=?, status='Активно' WHERE id=?",
+            (new_expire.strftime("%Y-%m-%d 23:59:59"), user_id)
+        )
+        await asyncio.to_thread(db.mark_promo_used, user_id, code)
+        await asyncio.to_thread(db.conn.commit)
+    except Exception as e:
+        # Дни не выданы — возвращаем занятое место, чтобы промокод не «сгорел»
+        await asyncio.to_thread(db.conn.execute, "UPDATE promo_codes SET uses=uses-1 WHERE code=? AND uses>0", (code,))
+        if isinstance(e, LookupError):
+            return "nouser", None
+        raise
+    return "ok", (days, new_expire)
+
 @dp.message(PromoState.waiting_code)
 async def promo_use(message: Message, state: FSMContext):
-    code = message.text.upper().strip()
+    """Окно промокода: пока коды неверные — можно пробовать снова (пауза 5 сек после каждой
+    неудачи). Как только код принят — режим ввода закрывается, дальнейшие сообщения игнорируются.
+    Выйти раньше: «Назад», /start, /help, /about."""
     user_id = message.from_user.id
-
-    if is_rate_limited(user_id, "promo_attempt", cooldown=3):
-        await message.answer("⏳ Слишком часто — попробуйте через пару секунд.")
+    if not message.text:
+        await message.answer("❌ Отправьте промокод текстом.", reply_markup=back_keyboard())
         return
+    code = message.text.upper().strip()
+    if not code or code.startswith("/"):
+        return  # неизвестная команда — не промокод
 
-    if await asyncio.to_thread(db.is_promo_used, user_id, code):
-        await message.answer("❌ Вы уже активировали этот промокод!")
-        await state.clear()
-        return
+    result = None
+    async with user_locks[user_id]:
+        # Сообщение могло дождаться лока, пока предыдущее уже приняло промокод (или человек вышел)
+        if await state.get_state() != PromoState.waiting_code.state:
+            return
+        wait = _promo_wrong_until.get(user_id, 0) - time.monotonic()
+        if wait > 0:
+            await message.answer(f"⏳ Подождите ещё {int(wait) + 1} сек. перед следующей попыткой.", reply_markup=back_keyboard())
+            return
+        try:
+            status, data = await _activate_promo(user_id, code)
+        except Exception as e:
+            logging.error(f"Ошибка активации промокода {code} у {user_id}: {e}")
+            status, data = "error", None
 
-    promo = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM promo_codes WHERE code=?", (code,))).fetchone()
-    if not promo:
-        await message.answer("❌ Промокод не найден")
-        await state.clear()
-        return
+        if status == "ok":
+            _promo_wrong_until.pop(user_id, None)
+            await state.clear()
+            days, new_expire = data
+            await message.answer(f"✅ Промокод активирован! Добавлено +{days} дней.")
+            result = new_expire
+        else:
+            if len(_promo_wrong_until) > 2000:   # чистим устаревшее, чтобы словарь не рос
+                now_m = time.monotonic()
+                for uid in [u for u, t in _promo_wrong_until.items() if t < now_m]:
+                    _promo_wrong_until.pop(uid, None)
+            _promo_wrong_until[user_id] = time.monotonic() + PROMO_WRONG_COOLDOWN
+            reason = {
+                "notfound": "❌ Промокод не найден.",
+                "used": "❌ Вы уже активировали этот промокод.",
+                "limit": "❌ Лимит использований этого промокода исчерпан.",
+                "nouser": "❌ Ошибка пользователя. Отправьте /start и попробуйте снова.",
+                "error": "❌ Не удалось проверить промокод, попробуйте ещё раз чуть позже.",
+            }[status]
+            if status == "nouser":
+                await state.clear()
+                await message.answer(reason)
+            else:
+                await message.answer(
+                    f"{reason}\nМожно попробовать другой промокод через {PROMO_WRONG_COOLDOWN} сек. "
+                    f"Чтобы выйти — «Назад», /start, /help или /about.",
+                    reply_markup=back_keyboard()
+                )
 
-    if promo[2] >= promo[3]:
-        await message.answer("❌ Лимит использований промокода исчерпан")
-        await state.clear()
-        return
-
-    user = await asyncio.to_thread(db.get_user, user_id)
-    if not user:
-        await message.answer("❌ Ошибка пользователя")
-        await state.clear()
-        return
-
-    try:
-        expire = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
-    except:
-        expire = datetime.now()
-
-    now = datetime.now()
-    if expire < now:
-        expire = now
-
-    days = promo[1]
-    new_expire = expire + timedelta(days=days)
-    new_expire_str = new_expire.strftime("%Y-%m-%d 23:59:59")
-
-    await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (new_expire_str, user_id))
-    await asyncio.to_thread(db.conn.execute, "UPDATE promo_codes SET uses=uses+1 WHERE code=?", (code,))
-    await asyncio.to_thread(db.mark_promo_used, user_id, code)
-    await asyncio.to_thread(db.conn.commit)
-
-    try:
-        await vpn_client.create_or_update_user(user_id, int(new_expire.replace(hour=23, minute=59, second=59).timestamp()))
-    except Exception as e:
-        logging.error(f"Ошибка синхронизации с VPN панелью после промокода: {e}")
-
-    await state.clear()
-    await message.answer(f"✅ Промокод активирован! Добавлено +{days} дней.")
+    if result is not None:
+        # Синхронизация с панелью — уже после ответа пользователю и вне лока: она может быть медленной.
+        # Если панель не подключена или недоступна, _sync_panel сама это обработает.
+        await _sync_panel(user_id, result.replace(hour=23, minute=59, second=59), reason="promo")
 
 ############################################################
 # SUPPORT TICKETS
