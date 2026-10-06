@@ -1795,6 +1795,7 @@ async def process_platega_pay(callback: CallbackQuery):
             reply_markup=payment_method_keyboard()
         )
         return
+    _pending_platega[transaction_id] = time.time()   # опрос статуса начнёт следить за ней
 
     expires_in = result.get("expiresIn", "00:15:00")
     pay_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2951,20 +2952,34 @@ async def platega_status_checker():
     - CONFIRMED — начисляет подписку (если callback не дошёл или начисление упало);
     - CANCELED — автоматически отправляет пользователю сообщение с кнопкой «Посмотреть тарифы».
     Переходы статусов атомарные, поэтому вместе с callback'ом начисление и сообщение
-    выполнятся ровно один раз."""
+    выполнятся ровно один раз.
+
+    Список транзакций ведётся в памяти (_pending_platega): пока ждать нечего, цикл вообще не
+    обращается ни к БД, ни к Platega — Neon может спокойно засыпать."""
     await asyncio.sleep(10)
+    loaded = False
     while True:
         try:
             if platega_client.is_configured():
-                since = (datetime.now() - timedelta(minutes=PLATEGA_POLL_WINDOW_MIN)).isoformat()
-                tx_ids = await asyncio.to_thread(db.get_pending_platega_ids, since)
-                for tx_id in tx_ids:
+                if not loaded:
+                    # Один раз после запуска: подхватываем неоплаченные транзакции, созданные до перезапуска
+                    since = (datetime.now() - timedelta(minutes=PLATEGA_POLL_WINDOW_MIN)).isoformat()
+                    for tx_id in await asyncio.to_thread(db.get_pending_platega_ids, since):
+                        _pending_platega.setdefault(tx_id, time.time())
+                    loaded = True
+                horizon = time.time() - PLATEGA_POLL_WINDOW_MIN * 60
+                for tx_id, created in list(_pending_platega.items()):
+                    if created < horizon:
+                        _pending_platega.pop(tx_id, None)   # слишком старая — больше не ждём
+                        continue
                     data = await platega_client.get_transaction_status(tx_id)
                     status = str(data.get("status", "")).upper() if isinstance(data, dict) else ""
                     if status == "CONFIRMED":
                         # Оплата прошла, а callback не дошёл (или начисление упало) — начисляем сами.
+                        # finalize сама уберёт транзакцию из списка, когда доведёт дело до конца.
                         _spawn(finalize_platega_confirmed(tx_id))
                     elif status == "CANCELED":
+                        _pending_platega.pop(tx_id, None)
                         claimed = await asyncio.to_thread(db.claim_platega_transaction, tx_id, "PENDING", "CANCELED")
                         if claimed:
                             try:
@@ -3076,6 +3091,12 @@ async def error_handler(event: ErrorEvent):
 
 _bg_tasks = set()
 
+# Неоплаченные транзакции Platega, за которыми следит опрос: tx_id -> время создания (time.time()).
+# Хранятся В ПАМЯТИ, чтобы опрос не ходил в БД каждые несколько секунд: постоянные запросы не
+# давали Neon «засыпать» (autosuspend) и сжигали вычислительные часы. БД читается один раз при
+# запуске (восстановление после перезапуска), дальше — только когда статус реально меняется.
+_pending_platega = {}
+
 def _spawn(coro):
     """Запускает фоновую задачу и держит на неё ссылку (иначе её может собрать GC)."""
     task = asyncio.create_task(coro)
@@ -3083,33 +3104,43 @@ def _spawn(coro):
     task.add_done_callback(_bg_tasks.discard)
     return task
 
-async def finalize_platega_confirmed(transaction_id: str):
+async def finalize_platega_confirmed(transaction_id: str) -> bool:
     """Начисляет оплаченную транзакцию Platega РОВНО один раз. Вызывается и из webhook'а,
     и из опроса статуса — что сработает первым, то и начислит: переход PENDING ->
     PROCESSING делается одним атомарным UPDATE, второй вызов получит None и выйдет.
-    Если начисление упало — статус возвращается в PENDING, и опрос Platega повторит его."""
+    Если начисление упало — статус возвращается в PENDING, и опрос Platega повторит его.
+    Возвращает True, когда с транзакцией покончено (опрос перестаёт её проверять)."""
     try:
         claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "PENDING", "PROCESSING")
         if not claimed:
-            return  # уже обработана (или обрабатывается)
+            # Уже обработана или обрабатывается прямо сейчас — смотрим, какой там статус
+            row = (await asyncio.to_thread(
+                db.conn.execute, "SELECT status FROM platega_transactions WHERE transaction_id=?", (transaction_id,)
+            )).fetchone()
+            resolved = row is None or row[0] not in ("PENDING", "PROCESSING")
+            if resolved:
+                _pending_platega.pop(transaction_id, None)
+            return resolved
         tx_user_id, tx_tariff_id = claimed[0], claimed[1]
         try:
             result = await activate_subscription(tx_user_id, tx_tariff_id)
         except Exception as e:
             logging.error(f"Platega: ошибка начисления {transaction_id}: {e}")
             await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "PENDING")
-            return
+            return False
 
         if not result:
             await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "FAILED")
+            _pending_platega.pop(transaction_id, None)
             logging.error(f"Platega: не удалось начислить {transaction_id} (user {tx_user_id}, тариф {tx_tariff_id})")
             try:
                 await bot.send_message(OWNER_ID, f"⚠️ Platega-оплата не начислена: user {tx_user_id}, тариф {tx_tariff_id}, tx {transaction_id}")
             except Exception:
                 pass
-            return
+            return True
 
         await asyncio.to_thread(db.set_platega_transaction_status, transaction_id, "CONFIRMED")
+        _pending_platega.pop(transaction_id, None)
         logging.info(f"Platega: оплата {transaction_id} начислена (user {tx_user_id}, тариф {tx_tariff_id})")
         days, new_expire_str = result
         try:
@@ -3122,8 +3153,10 @@ async def finalize_platega_confirmed(transaction_id: str):
             )
         except Exception:
             pass
+        return True
     except Exception as e:
         logging.error(f"Platega: сбой финализации {transaction_id}: {e}")
+        return False
 
 async def handle_ping(request):
     return web.Response(text="Bot is running", status=200)
@@ -3167,6 +3200,7 @@ async def handle_platega_callback(request):
         _spawn(finalize_platega_confirmed(transaction_id))
 
     elif status == "CANCELED":
+        _pending_platega.pop(transaction_id, None)
         claimed = await asyncio.to_thread(db.claim_platega_transaction, transaction_id, "PENDING", "CANCELED")
         if claimed:
             try:
