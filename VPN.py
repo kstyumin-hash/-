@@ -4,7 +4,6 @@
 # ==========================================================
 
 import asyncio
-from html import escape as html_escape
 import logging
 import aiohttp
 import psycopg2
@@ -34,9 +33,7 @@ from aiogram.types import (
     BotCommand,
     ErrorEvent,
     LabeledPrice,
-    PreCheckoutQuery,
-    InputMediaPhoto,
-    InputMediaVideo
+    PreCheckoutQuery
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -714,26 +711,6 @@ class Database:
         self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vless_key TEXT DEFAULT ''")
         self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_key_reset TEXT DEFAULT ''")
         
-        self.conn.execute("""
-        CREATE TABLE IF NOT EXISTS tickets(
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            message TEXT,
-            answer TEXT,
-            status TEXT
-        )
-        """)
-        # Вложения к тикетам (фото/файл) — добавляем колонки, если их ещё нет
-        # (безопасно и для новой БД, и для уже существующей)
-        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_id TEXT DEFAULT ''")
-        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS file_type TEXT DEFAULT ''")
-        # Нужна для авточистки: удаляем по возрасту ЗАКРЫТИЯ, а не создания,
-        # и только закрытые тикеты — открытые обращения не трогаем никогда.
-        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TEXT DEFAULT ''")
-        # Все вложения тикета одним JSON-списком: [{"t": "photo"|"video"|"document", "f": file_id}, ...]
-        # (file_id/file_type выше остаются для старых тикетов и превью — туда пишется первое вложение)
-        self.conn.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS attachments TEXT DEFAULT ''")
-
         # Флаг «принял условия использования / политику конфиденциальности» —
         # чтобы приветственный экран показывался пользователю ровно один раз.
         # Если колонки ещё не было — это миграция на уже работающей базе:
@@ -1014,9 +991,6 @@ db = Database()
 # FSM СОСТОЯНИЯ
 ############################################################
 
-class TicketState(StatesGroup):
-    waiting_text = State()
-
 class AdminGiveState(StatesGroup):
     waiting_data = State()
 
@@ -1028,9 +1002,6 @@ class AdminToggleState(StatesGroup):
 
 class AdminProfileState(StatesGroup):
     waiting_username = State()
-
-class ReplyState(StatesGroup):
-    waiting_answer = State()
 
 class BroadcastState(StatesGroup):
     waiting_text = State()
@@ -1231,9 +1202,11 @@ def admin_back_keyboard():
         [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")]
     ])
 
+SUPPORT_BOT_URL = "https://t.me/StopkaSupport_bot"
+
 def support_keyboard(style=None):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("📨 Написать в поддержку", callback_data="create_ticket", style=style)]
+        [btn("📨 Написать в поддержку", url=SUPPORT_BOT_URL, style=style)]
     ])
 
 def admin_keyboard():
@@ -1243,27 +1216,10 @@ def admin_keyboard():
         [btn("📅 Выдать дни подписки", callback_data="admin_give", style="success")],
         [btn("👥 Статистика пользователей", callback_data="users_count", style="success")],
         [btn("📢 Рассылка", callback_data="broadcast", style="success")],
-        [btn("🎟 Тикеты", callback_data="admin_tickets", style="success")],
         [btn("🎁 Промокоды", callback_data="promo_admin", style="success")],
         [btn("👑 Назначить/Удалить админа", callback_data="admin_toggle", style="success")],
         [InlineKeyboardButton(text="⬅ Главное меню", callback_data="profile", style="danger")]
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def ticket_list_keyboard(tickets):
-    buttons = []
-    for ticket in tickets:
-        preview = ticket[2][:20] if ticket[2] else ""
-        if not preview:
-            items = ticket_attachments(ticket)
-            if len(items) > 1:
-                preview = "📎 " + attachments_summary(items)
-            elif items:
-                preview = {"photo": "📷 Фото", "video": "🎬 Видео", "document": "📎 Файл"}.get(items[0][0], "…")
-            else:
-                preview = "…"
-        buttons.append([InlineKeyboardButton(text=f"🎟 #{ticket[0]} | {preview}", callback_data=f"ticket_{ticket[0]}")])
-    buttons.append([InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def promo_admin_keyboard():
@@ -1340,8 +1296,8 @@ def build_profile_text(user_id, user_data):
 
 async def safe_edit(callback: CallbackQuery, text: str, reply_markup=None):
     """Пытается отредактировать текст сообщения. Если это невозможно —
-    например, текущее сообщение с фото/файлом (как открытый тикет с
-    вложением), а Telegram не даёт превратить его в текстовое через edit —
+    например, текущее сообщение с фото/файлом,
+    а Telegram не даёт превратить его в текстовое через edit —
     удаляет его и отправляет новое текстовое сообщение вместо него."""
     try:
         await callback.message.edit_text(text, reply_markup=reply_markup)
@@ -2256,139 +2212,6 @@ async def promo_use(message: Message, state: FSMContext):
         await _sync_panel(user_id, result.replace(hour=23, minute=59, second=59), reason="promo")
 
 ############################################################
-# SUPPORT TICKETS
-############################################################
-
-TICKET_MAX_PHOTOS = 5      # фото в одном обращении
-TICKET_MAX_VIDEOS = 1      # видео в одном обращении
-TICKET_MAX_DOCS = 1        # файл (как и раньше — один)
-TICKET_ALBUM_WAIT = 1.5    # сек: сколько ждём остальные части альбома после первой
-
-_TICKET_CAPS = {"photo": TICKET_MAX_PHOTOS, "video": TICKET_MAX_VIDEOS, "document": TICKET_MAX_DOCS}
-_ticket_albums = {}        # (user_id, media_group_id) -> {"items": [...], "text": str, "rejected": bool}
-
-def ticket_attachments(ticket):
-    """Список (тип, file_id) вложений тикета. Старые тикеты (одно вложение в
-    file_id/file_type) читаются так же."""
-    raw = ticket[8] if len(ticket) > 8 else ""
-    if raw:
-        try:
-            res = [(i["t"], i["f"]) for i in json.loads(raw) if i.get("t") and i.get("f")]
-            if res:
-                return res
-        except Exception:
-            pass
-    file_id = ticket[5] if len(ticket) > 5 else ""
-    file_type = ticket[6] if len(ticket) > 6 else ""
-    return [(file_type, file_id)] if file_id and file_type else []
-
-def attachments_summary(items):
-    names = (("photo", "фото"), ("video", "видео"), ("document", "файл"))
-    parts = []
-    for t, name in names:
-        n = sum(1 for x in items if x[0] == t)
-        if n:
-            parts.append(f"{n} {name}")
-    return ", ".join(parts)
-
-def _limit_ticket_items(items):
-    counts, kept, dropped = {}, [], 0
-    for t, f in items:
-        if counts.get(t, 0) < _TICKET_CAPS.get(t, 0):
-            counts[t] = counts.get(t, 0) + 1
-            kept.append((t, f))
-        else:
-            dropped += 1
-    return kept, dropped
-
-def _ticket_media_item(message: Message):
-    if message.photo:
-        return ("photo", message.photo[-1].file_id)
-    if message.video:
-        return ("video", message.video.file_id)
-    if message.document:
-        return ("document", message.document.file_id)
-    return None
-
-@dp.callback_query(F.data == "create_ticket")
-async def create_ticket(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(TicketState.waiting_text)
-    await callback.message.edit_text(
-        f"📝 Опишите вашу проблему или напишите по поводу оплаты в одном сообщении.\n\n"
-        f"📸 Можно приложить до {TICKET_MAX_PHOTOS} фото и {TICKET_MAX_VIDEOS} видео — "
-        f"выберите несколько файлов сразу и отправьте одним альбомом, описание напишите в подписи. "
-        f"Или один файл (например, чек):",
-        reply_markup=back_keyboard()
-    )
-    await callback.answer()
-
-async def _create_ticket(user_id: int, text: str, items, reply_to: Message, state: FSMContext):
-    kept, dropped = _limit_ticket_items(items)
-    if not text and not kept:
-        await reply_to.answer(f"❌ Пришлите текст, фото, видео или файл с описанием проблемы.")
-        return
-
-    first_type, first_id = kept[0] if kept else ("", "")
-    attachments_json = json.dumps([{"t": t, "f": f} for t, f in kept]) if kept else ""
-    await asyncio.to_thread(db.conn.execute,
-        "INSERT INTO tickets (user_id, message, answer, status, file_id, file_type, attachments) VALUES(?,?,?,?,?,?,?)",
-        (user_id, text, "", "Открыт", first_id, first_type, attachments_json)
-    )
-    await asyncio.to_thread(db.conn.commit)
-    await state.clear()
-
-    reply = f"✅ Ваше обращение отправлено в поддержку!"
-    if kept:
-        reply += f"\n📸 Приложено: {attachments_summary(kept)}"
-    if dropped:
-        reply += (f"\nℹ️ Часть вложений не принята: в одном обращении можно до "
-                  f"{TICKET_MAX_PHOTOS} фото и {TICKET_MAX_VIDEOS} видео.")
-    await reply_to.answer(reply, reply_markup=back_keyboard())
-
-async def _finalize_ticket_album(key, first_message: Message, state: FSMContext):
-    """Альбом приходит несколькими сообщениями с общим media_group_id. Ждём остальные
-    части и создаём ОДНО обращение со всеми вложениями."""
-    await asyncio.sleep(TICKET_ALBUM_WAIT)
-    buf = _ticket_albums.pop(key, None)
-    if not buf or buf["rejected"]:
-        return
-    items = [it for _, it in sorted(buf["items"], key=lambda x: x[0])]  # в порядке отправки
-    try:
-        await _create_ticket(key[0], buf["text"], items, first_message, state)
-    except Exception as e:
-        logging.error(f"Ошибка создания обращения с альбомом: {e}")
-
-@dp.message(TicketState.waiting_text, F.text | F.photo | F.video | F.document)
-async def process_ticket(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    text = (message.text or message.caption or "").strip()
-    item = _ticket_media_item(message)
-
-    if message.media_group_id:
-        key = (user_id, message.media_group_id)
-        buf = _ticket_albums.get(key)
-        if buf is None:
-            # Первое сообщение альбома: лимит частоты проверяем один раз на весь альбом
-            rejected = is_rate_limited(user_id, "create_ticket", cooldown=10)
-            buf = {"items": [], "text": "", "rejected": rejected}
-            _ticket_albums[key] = buf
-            _spawn(_finalize_ticket_album(key, message, state))
-            if rejected:
-                await message.answer("⏳ Обращение уже отправляется — подождите немного перед следующим.")
-        if buf["rejected"]:
-            return
-        if item:
-            buf["items"].append((message.message_id, item))
-        if text and not buf["text"]:
-            buf["text"] = text
-        return
-
-    if is_rate_limited(user_id, "create_ticket", cooldown=10):
-        await message.answer("⏳ Обращение уже отправляется — подождите немного перед следующим.")
-        return
-    await _create_ticket(user_id, text, [item] if item else [], message, state)
-
-############################################################
 # ADMIN PANEL
 ############################################################
 
@@ -2595,197 +2418,6 @@ async def give_days(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Выдано {days} дней пользователю {username}", reply_markup=admin_back_keyboard())
 
-@dp.callback_query(F.data == "admin_tickets")
-async def admin_tickets(callback: CallbackQuery):
-    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
-        await callback.answer("❌ Нет прав", show_alert=True)
-        return
-    cursor = await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE status='Открыт'")
-    tickets = cursor.fetchall()
-    if not tickets:
-        await safe_edit(callback, "🎟 Открытых тикетов нет", reply_markup=admin_back_keyboard())
-        return
-    await safe_edit(callback, "🎟 <b>Открытые обращения:</b>", reply_markup=ticket_list_keyboard(tickets))
-
-@dp.callback_query(F.data.startswith("ticket_"))
-async def open_ticket(callback: CallbackQuery):
-    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
-        return
-    ticket_id = int(callback.data.split("_")[1])
-    ticket = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
-    if not ticket:
-        await callback.answer("Тикет не найден", show_alert=True)
-        return
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [btn("✉️ Ответить", callback_data=f"reply_{ticket_id}", style="success")],
-        [btn("❌ Закрыть", callback_data=f"close_{ticket_id}", style="danger")],
-        [InlineKeyboardButton(text="⬅ Назад в админ-панель", callback_data="admin", style="danger")]
-    ])
-    items = ticket_attachments(ticket)
-    caption = (f"🎟 <b>Тикет #{ticket[0]}</b>\n"
-               f"👤 Пользователь ID: <code>{ticket[1]}</code>\n\n"
-               f"💬 Сообщение:\n{html_escape(ticket[2]) if ticket[2] else '—'}")
-    if items:
-        caption += f"\n\n📸 Вложения: {attachments_summary(items)}"
-
-    async def send_one(kind, file_id, cap=None, markup=None):
-        if kind == "photo":
-            return await callback.message.answer_photo(photo=file_id, caption=cap, reply_markup=markup)
-        if kind == "video":
-            return await callback.message.answer_video(video=file_id, caption=cap, reply_markup=markup)
-        return await callback.message.answer_document(document=file_id, caption=cap, reply_markup=markup)
-
-    if not items:
-        await callback.message.edit_text(caption, reply_markup=keyboard)
-        await callback.answer()
-        return
-
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    try:
-        if len(items) == 1 and len(caption) <= 1000:
-            # Одно вложение — как раньше: подпись и кнопки прямо под ним
-            await send_one(items[0][0], items[0][1], caption, keyboard)
-        else:
-            media = [i for i in items if i[0] in ("photo", "video")]
-            docs = [i for i in items if i[0] == "document"]
-            if len(media) >= 2:
-                await callback.message.answer_media_group([
-                    InputMediaPhoto(media=f) if t == "photo" else InputMediaVideo(media=f) for t, f in media
-                ])
-            elif media:
-                await send_one(media[0][0], media[0][1])
-            for t, f in docs:
-                await send_one(t, f)
-            # У альбома кнопок быть не может — текст с кнопками идёт отдельным сообщением
-            await callback.message.answer(caption, reply_markup=keyboard)
-    except Exception as e:
-        logging.error(f"Тикет #{ticket_id}: не удалось показать вложения: {e}")
-        await callback.message.answer(caption + "\n\n⚠️ Не удалось загрузить вложения.", reply_markup=keyboard)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("reply_"))
-async def reply_ticket(callback: CallbackQuery, state: FSMContext):
-    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
-        return
-    ticket_id = int(callback.data.split("_")[1])
-    await state.update_data(ticket_id=ticket_id)
-    await state.set_state(ReplyState.waiting_answer)
-    await safe_edit(callback, "✉️ Введите текст ответа:", reply_markup=admin_back_keyboard())
-    await callback.answer()
-
-_reply_albums = {}   # (admin_id, media_group_id) -> {"items": [...], "text": str, "ticket_id": int}
-
-async def _send_answer_to_user(user_id: int, text: str, items, _escaped=False) -> bool:
-    """Отправляет ответ поддержки пользователю: текст и/или фото, видео, файлы.
-    Возвращает True, если доставлено."""
-    caption = "📩 <b>Ответ поддержки:</b>" + (f"\n\n{text}" if text else "")
-    try:
-        if not items:
-            await bot.send_message(user_id, caption)
-            return True
-        media = [i for i in items if i[0] in ("photo", "video")]
-        docs = [i for i in items if i[0] == "document"]
-        use_caption = len(caption) <= 1000      # лимит подписи в Telegram — 1024
-        cap = caption if use_caption else None
-        if len(media) >= 2:
-            group = []
-            for idx, (t, f) in enumerate(media):
-                c = cap if idx == 0 else None
-                group.append(InputMediaPhoto(media=f, caption=c) if t == "photo" else InputMediaVideo(media=f, caption=c))
-            await bot.send_media_group(user_id, group)
-            cap = None
-        elif media:
-            t, f = media[0]
-            if t == "photo":
-                await bot.send_photo(user_id, f, caption=cap)
-            else:
-                await bot.send_video(user_id, f, caption=cap)
-            cap = None
-        for t, f in docs:
-            await bot.send_document(user_id, f, caption=cap)
-            cap = None
-        if not use_caption:
-            await bot.send_message(user_id, caption)
-        return True
-    except Exception as e:
-        if not _escaped and "parse" in str(e).lower():
-            # В тексте админа попался «<» или другая HTML-разметка, которую Telegram не принял —
-            # отправляем тот же текст как обычный.
-            return await _send_answer_to_user(user_id, html_escape(text), items, _escaped=True)
-        logging.warning(f"Не удалось отправить ответ поддержки пользователю {user_id}: {e}")
-        return False
-
-async def _deliver_ticket_answer(ticket_id: int, text: str, items, reply_to: Message, state: FSMContext):
-    ticket = (await asyncio.to_thread(db.conn.execute, "SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
-    delivered = True
-    if ticket:
-        delivered = await _send_answer_to_user(ticket[1], text, items)
-        saved_answer = text or (f"[вложения: {attachments_summary(items)}]" if items else "")
-        await asyncio.to_thread(
-            db.conn.execute,
-            "UPDATE tickets SET answer=?, status='Закрыт', closed_at=? WHERE id=?",
-            (saved_answer, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticket_id)
-        )
-        await asyncio.to_thread(db.conn.commit)
-    await state.clear()
-    if delivered:
-        await reply_to.answer("✅ Ответ отправлен!", reply_markup=admin_back_keyboard())
-    else:
-        await reply_to.answer("⚠️ Не удалось доставить ответ (возможно, пользователь заблокировал бота). Тикет закрыт.",
-                              reply_markup=admin_back_keyboard())
-
-async def _finalize_reply_album(key, first_message: Message, state: FSMContext):
-    await asyncio.sleep(TICKET_ALBUM_WAIT)
-    buf = _reply_albums.pop(key, None)
-    if not buf:
-        return
-    items = [it for _, it in sorted(buf["items"], key=lambda x: x[0])]
-    try:
-        await _deliver_ticket_answer(buf["ticket_id"], buf["text"], items, first_message, state)
-    except Exception as e:
-        logging.error(f"Ошибка отправки ответа с альбомом: {e}")
-
-@dp.message(ReplyState.waiting_answer)
-async def send_ticket_answer(message: Message, state: FSMContext):
-    if not await asyncio.to_thread(db.is_admin, message.from_user.id):
-        return
-    data = await state.get_data()
-    ticket_id = data["ticket_id"]
-    text = (message.text or message.caption or "").strip()
-    item = _ticket_media_item(message)
-
-    # Альбом приходит несколькими сообщениями — собираем и отправляем одним ответом
-    if message.media_group_id:
-        key = (message.from_user.id, message.media_group_id)
-        buf = _reply_albums.get(key)
-        if buf is None:
-            buf = {"items": [], "text": "", "ticket_id": ticket_id}
-            _reply_albums[key] = buf
-            _spawn(_finalize_reply_album(key, message, state))
-        if item:
-            buf["items"].append((message.message_id, item))
-        if text and not buf["text"]:
-            buf["text"] = text
-        return
-
-    if not text and not item:
-        await message.answer("❌ Пришлите текст, фото, видео или файл с ответом.")
-        return
-    await _deliver_ticket_answer(ticket_id, text, [item] if item else [], message, state)
-
-@dp.callback_query(F.data.startswith("close_"))
-async def close_ticket(callback: CallbackQuery):
-    if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
-        return
-    ticket_id = int(callback.data.split("_")[1])
-    await asyncio.to_thread(db.conn.execute, "UPDATE tickets SET status='Закрыт', closed_at=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ticket_id))
-    await asyncio.to_thread(db.conn.commit)
-    await callback.answer("✅ Тикет закрыт")
-    await admin_tickets(callback)
-
 @dp.callback_query(F.data == "promo_admin")
 async def promo_admin(callback: CallbackQuery):
     if not await asyncio.to_thread(db.is_admin, callback.from_user.id):
@@ -2943,7 +2575,6 @@ async def subscription_checker():
         await asyncio.sleep(3600)
 
 LOGS_RETENTION_DAYS = 7              # admin_logs и notifications старше — удаляются
-CLOSED_TICKETS_RETENTION_DAYS = 30   # закрытые тикеты (текст, ответ, file_id) старше — удаляются; открытые не трогаем
 PLATEGA_POLL_INTERVAL = 15           # как часто бот спрашивает Platega о статусе, сек
 PLATEGA_POLL_WINDOW_MIN = 360        # проверяем неоплаченные транзакции за последние N минут (6 ч — с запасом на простой бота)
 
@@ -3010,9 +2641,6 @@ def cleanup_memory_state():
 async def db_cleanup_task():
     """Автоочистка накопительных данных, чтобы БД (Neon) не забивалась.
     - admin_logs, notifications: старше LOGS_RETENTION_DAYS.
-    - tickets: только ЗАКРЫТЫЕ старше CLOSED_TICKETS_RETENTION_DAYS (вместе с текстом,
-      ответом и file_id). Открытые не удаляются никогда. Закрытые без даты закрытия
-      (старые записи) получают дату сегодня и уйдут по сроку.
     - platega_transactions: ВСЕ транзакции старше 14 дней (отменённые, неоплаченные и оплаченные).
       Зависшие PROCESSING (сбой во время начисления) возвращаются в PENDING.
     - stars_payments: старше 180 дней.
@@ -3023,7 +2651,6 @@ async def db_cleanup_task():
             now = datetime.now()
             fmt = "%Y-%m-%d %H:%M:%S"
             log_cutoff = (now - timedelta(days=LOGS_RETENTION_DAYS)).strftime(fmt)
-            ticket_cutoff = (now - timedelta(days=CLOSED_TICKETS_RETENTION_DAYS)).strftime(fmt)
             dead_cutoff = (now - timedelta(days=PLATEGA_DEAD_RETENTION_DAYS)).isoformat()
             done_cutoff = (now - timedelta(days=PLATEGA_DONE_RETENTION_DAYS)).isoformat()
             stars_cutoff = (now - timedelta(days=STARS_RETENTION_DAYS)).isoformat()
@@ -3031,11 +2658,6 @@ async def db_cleanup_task():
 
             deleted_logs = (await ex("DELETE FROM admin_logs WHERE created_at < ?", (log_cutoff,))).rowcount
             deleted_notifs = (await ex("DELETE FROM notifications WHERE date < ?", (log_cutoff[:10],))).rowcount
-
-            await ex("UPDATE tickets SET closed_at=? WHERE status='Закрыт' AND (closed_at IS NULL OR closed_at='')", (now.strftime(fmt),))
-            deleted_tickets = (await ex(
-                "DELETE FROM tickets WHERE status='Закрыт' AND closed_at != '' AND closed_at < ?", (ticket_cutoff,)
-            )).rowcount
 
             await ex(
                 "UPDATE platega_transactions SET status='PENDING' WHERE status='PROCESSING' AND created_at < ?",
@@ -3054,10 +2676,10 @@ async def db_cleanup_task():
 
             cleanup_memory_state()
 
-            if deleted_logs or deleted_notifs or deleted_tickets or deleted_tx or deleted_stars or deleted_used:
+            if deleted_logs or deleted_notifs or deleted_tx or deleted_stars or deleted_used:
                 logging.info(
                     f"🧹 Автоочистка БД: admin_logs -{deleted_logs}, notifications -{deleted_notifs}, "
-                    f"тикетов -{deleted_tickets}, транзакций Platega -{deleted_tx}, "
+                    f"транзакций Platega -{deleted_tx}, "
                     f"Stars -{deleted_stars}, used_promos -{deleted_used}"
                 )
         except Exception as e:
