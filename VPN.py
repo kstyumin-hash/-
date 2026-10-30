@@ -1538,7 +1538,9 @@ async def get_vless_key(callback: CallbackQuery):
         return
 
     vless_key = user[11]
-    if not vless_key:
+    # Старое/битое значение (например "1") не считаем ключом — выпускаем заново.
+    if not vless_key or not str(vless_key).startswith(("http://", "https://", "vless://")):
+        vless_key = ""
         try:
             expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
             timestamp = int(expire_dt.timestamp())
@@ -2852,6 +2854,7 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logging.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+    logging.info("VPN.py: версия 2026-10-30 (проверка ключа, 3x-ui)")
 
 ############################################################
 # START BOT
