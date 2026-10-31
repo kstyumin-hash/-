@@ -143,10 +143,26 @@ class VPNClient:
         # запросами. unsafe=True: иначе aiohttp не сохраняет cookie, если панель
         # открыта по IP-адресу, и каждый запрос шёл бы «неавторизованным».
         if self._session is None or self._session.closed:
+            from urllib.parse import urlparse
+            _u = urlparse(self.base_url)
+            _origin = f"{_u.scheme}://{_u.netloc}" if _u.scheme and _u.netloc else ""
+            # Часть хостингов/прокси режет запросы с «питоновским» User-Agent (HTTP 403),
+            # поэтому представляемся обычным браузером.
+            _headers = {
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            if _origin:
+                _headers["Origin"] = _origin
+                _headers["Referer"] = self.base_url + "/"
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=8, connect=4),
                 cookie_jar=aiohttp.CookieJar(unsafe=True),
-                connector=aiohttp.TCPConnector(ttl_dns_cache=300, limit=10)
+                connector=aiohttp.TCPConnector(ttl_dns_cache=300, limit=10),
+                headers=_headers,
             )
         return self._session
 
@@ -161,8 +177,10 @@ class VPNClient:
                 f"{self.base_url}/login",
                 data={"username": self.username, "password": self.password}
             ) as resp:
+                raw_text = await resp.text()
                 try:
-                    data = await resp.json(content_type=None)
+                    import json as _json
+                    data = _json.loads(raw_text)
                 except Exception:
                     data = {}
                 self._logged_in = (resp.status == 200 and isinstance(data, dict)
@@ -170,7 +188,11 @@ class VPNClient:
                 if self._logged_in:
                     self._login_gen += 1
                 else:
-                    logging.error(f"3x-ui: не удалось авторизоваться (status={resp.status})")
+                    snippet = " ".join(raw_text.split())[:200]
+                    logging.error(
+                        f"3x-ui: не удалось авторизоваться (status={resp.status}, "
+                        f"server={resp.headers.get('Server', '-')}, ответ: {snippet})"
+                    )
         except Exception as e:
             logging.error(f"Ошибка авторизации в 3x-ui: {e}")
             self._logged_in = False
@@ -2854,7 +2876,7 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logging.info(f"🌐 Веб-сервер запущен на порту {PORT}")
-    logging.info("VPN.py: версия 2026-10-30 (проверка ключа, 3x-ui)")
+    logging.info("VPN.py: версия 2026-10-31 (заголовки 3x-ui, лог 403)")
 
 ############################################################
 # START BOT
