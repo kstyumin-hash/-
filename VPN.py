@@ -122,6 +122,7 @@ class VPNClient:
         self._session = None
         self._logged_in = False
         self._login_gen = 0        # растёт после каждого успешного логина
+        self._csrf = ""           # CSRF-токен 3x-ui v3+ (нужен даже для /login)
         self._login_lock = None    # локи создаются лениво — уже внутри event loop
         self._write_lock = None
 
@@ -170,12 +171,53 @@ class VPNClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _fetch_csrf(self, path="/"):
+        """3x-ui v3+ отвечает 403 на POST без CSRF-токена (в т.ч. на /login).
+        Токен лежит в <meta name="csrf-token"> страницы панели; запасной путь — GET /csrf-token."""
+        import re
+        session = self._get_session()
+        for p in (path, "/csrf-token"):
+            try:
+                async with session.get(f"{self.base_url}{p}") as resp:
+                    status = resp.status
+                    text = await resp.text()
+            except Exception as e:
+                logging.warning(f"3x-ui: не удалось получить CSRF-токен с {p}: {e}")
+                continue
+            if status != 200:
+                continue
+            m = (re.search(r'name=["\']csrf-token["\']\s+content=["\']([^"\']+)', text)
+                 or re.search(r'content=["\']([^"\']+)["\']\s+name=["\']csrf-token', text))
+            if m:
+                self._csrf = m.group(1)
+                return True
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = None
+            tok = None
+            if isinstance(data, dict):
+                tok = data.get("obj") or data.get("token") or data.get("csrfToken") or data.get("csrf_token")
+                if isinstance(tok, dict):
+                    tok = tok.get("token") or tok.get("csrfToken")
+            elif isinstance(data, str):
+                tok = data
+            if isinstance(tok, str) and tok:
+                self._csrf = tok
+                return True
+        return False
+
     async def _do_login(self):
         session = self._get_session()
         try:
+            self._csrf = ""
+            if not await self._fetch_csrf("/"):
+                logging.warning("3x-ui: CSRF-токен на странице входа не найден (старая версия панели?) — логинимся без него")
+            _hdrs = {"X-CSRF-Token": self._csrf} if self._csrf else {}
             async with session.post(
                 f"{self.base_url}/login",
-                data={"username": self.username, "password": self.password}
+                data={"username": self.username, "password": self.password},
+                headers=_hdrs
             ) as resp:
                 raw_text = await resp.text()
                 try:
@@ -187,11 +229,14 @@ class VPNClient:
                                    and bool(data.get("success", False)))
                 if self._logged_in:
                     self._login_gen += 1
+                    # Токен привязан к сессии — после входа берём свежий.
+                    await self._fetch_csrf("/panel/")
                 else:
                     snippet = " ".join(raw_text.split())[:200]
                     logging.error(
                         f"3x-ui: не удалось авторизоваться (status={resp.status}, "
-                        f"server={resp.headers.get('Server', '-')}, ответ: {snippet})"
+                        f"server={resp.headers.get('Server', '-')}, csrf={'есть' if self._csrf else 'нет'}, "
+                        f"ответ: {snippet})"
                     )
         except Exception as e:
             logging.error(f"Ошибка авторизации в 3x-ui: {e}")
@@ -223,7 +268,10 @@ class VPNClient:
                 last_err = "не удалось авторизоваться"
             else:
                 try:
-                    async with self._get_session().request(method, url, **kwargs) as resp:
+                    _kw = dict(kwargs)
+                    if self._csrf:
+                        _kw["headers"] = {**(kwargs.get("headers") or {}), "X-CSRF-Token": self._csrf}
+                    async with self._get_session().request(method, url, **_kw) as resp:
                         status = resp.status
                         try:
                             data = await resp.json(content_type=None)
