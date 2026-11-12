@@ -320,7 +320,10 @@ class VPNClient:
         if status != 200 or not isinstance(data, dict) or not data.get("success") or not data.get("obj"):
             raise PanelError(f"не удалось прочитать inbound {self.inbound_id} (HTTP {status})")
         try:
-            settings = json.loads(data["obj"].get("settings") or "{}")
+            # В 3x-ui v3+ settings приходит уже готовым объектом, в старых версиях — JSON-строкой.
+            settings = data["obj"].get("settings") or {}
+            if isinstance(settings, (str, bytes, bytearray)):
+                settings = json.loads(settings or "{}")
         except Exception as e:
             raise PanelError(f"settings inbound {self.inbound_id} не разобрались: {e}")
         for client in settings.get("clients", []):
