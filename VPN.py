@@ -316,6 +316,16 @@ class VPNClient:
     async def _find_existing_client(self, email):
         """Возвращает dict существующего клиента по email или None, если клиента нет.
         Бросает PanelError, если панель не ответила / inbound не прочитался."""
+        # 3x-ui v3+: клиент — отдельная сущность, его можно прочитать по email.
+        try:
+            status, data = await self._request("GET", f"/panel/api/clients/get/{email}")
+        except PanelError:
+            status, data = 0, None
+        if status == 200 and isinstance(data, dict) and data.get("success") and isinstance(data.get("obj"), dict):
+            obj = data["obj"]
+            found = obj.get("client") if isinstance(obj.get("client"), dict) else obj
+            if found.get("email") == email:
+                return found
         status, data = await self._request("GET", f"/panel/api/inbounds/get/{self.inbound_id}")
         if status != 200 or not isinstance(data, dict) or not data.get("success") or not data.get("obj"):
             raise PanelError(f"не удалось прочитать inbound {self.inbound_id} (HTTP {status})")
@@ -330,6 +340,19 @@ class VPNClient:
             if client.get("email") == email:
                 return client
         return None
+
+    async def _read_sub_id(self, email):
+        """subId клиента, как он сохранён на панели (3x-ui v3+). Пусто, если прочитать не вышло."""
+        try:
+            status, data = await self._request("GET", f"/panel/api/clients/get/{email}")
+        except PanelError:
+            return ""
+        if status == 200 and isinstance(data, dict) and data.get("success"):
+            obj = data.get("obj")
+            if isinstance(obj, dict):
+                client = obj.get("client") if isinstance(obj.get("client"), dict) else obj
+                return str(client.get("subId") or "")
+        return ""
 
     def _build_sub_link(self, sub_id):
         if not sub_id:
@@ -358,6 +381,29 @@ class VPNClient:
             payload.setdefault(key, default)
         return payload
 
+    @staticmethod
+    def _fix_tgid(payload):
+        # Клиенты, созданные старым кодом, могли получить tgId "" — новая панель ждёт число.
+        tg = payload.get("tgId")
+        if isinstance(tg, str):
+            payload["tgId"] = int(tg) if tg.strip().isdigit() else 0
+        return payload
+
+    def _client_payload_v3(self, base, email, expiry_ms, sub_id):
+        # /clients/update ждёт полное тело клиента, а не патч: берём все поля существующего
+        # клиента и меняем только нужные.
+        payload = dict(base or {})
+        payload.update({
+            "email": email,
+            "enable": True,
+            "expiryTime": expiry_ms,
+            "limitIp": self.device_limit,
+            "subId": sub_id,
+        })
+        payload.setdefault("totalGB", 0)
+        payload.setdefault("tgId", 0)
+        return self._fix_tgid(payload)
+
     async def _create_or_update_locked(self, user_id, expire_timestamp):
         # Вызывать только под self._write_lock.
         email = f"user_{user_id}"
@@ -373,11 +419,23 @@ class VPNClient:
         if not existing:
             client_uuid = str(uuid.uuid4())
             sub_id = uuid.uuid4().hex
-            payload = self._client_payload(None, client_uuid, email, expiry_ms, sub_id)
-            if await self._api_post(
-                "/panel/api/inbounds/addClient",
-                {"id": self.inbound_id, "settings": json.dumps({"clients": [payload]})}
-            ):
+            # 3x-ui v3+: старый /inbounds/addClient удалён, клиентов создаёт /panel/api/clients/add.
+            payload = {
+                "client": {
+                    "id": client_uuid,
+                    "email": email,
+                    "subId": sub_id,
+                    "enable": True,
+                    "expiryTime": expiry_ms,
+                    "totalGB": 0,
+                    "limitIp": self.device_limit,
+                    "tgId": 0,
+                },
+                "inboundIds": [self.inbound_id],
+            }
+            if await self._api_post("/panel/api/clients/add", payload):
+                # Панель могла подставить свой subId — берём тот, что реально сохранился.
+                sub_id = (await self._read_sub_id(email)) or sub_id
                 return self._build_sub_link(sub_id)
             # Ответ мог потеряться, хотя клиент уже создан, — проверяем, а не плодим дубль.
             try:
@@ -387,13 +445,9 @@ class VPNClient:
             if not existing:
                 return ""
 
-        client_uuid = existing.get("id")
         sub_id = existing.get("subId") or uuid.uuid4().hex
-        payload = self._client_payload(existing, client_uuid, email, expiry_ms, sub_id)
-        ok = await self._api_post(
-            f"/panel/api/inbounds/updateClient/{client_uuid}",
-            {"id": self.inbound_id, "settings": json.dumps({"clients": [payload]})}
-        )
+        payload = self._client_payload_v3(existing, email, expiry_ms, sub_id)
+        ok = await self._api_post(f"/panel/api/clients/update/{email}", payload)
         return self._build_sub_link(sub_id) if ok else ""
 
     async def create_or_update_user(self, user_id, expire_timestamp):
@@ -415,19 +469,16 @@ class VPNClient:
                 return False
             if not existing:
                 return False
-            payload = dict(existing)
+            payload = self._fix_tgid(dict(existing))
             payload["enable"] = False
-            return await self._api_post(
-                f"/panel/api/inbounds/updateClient/{existing['id']}",
-                {"id": self.inbound_id, "settings": json.dumps({"clients": [payload]})}
-            )
+            return await self._api_post(f"/panel/api/clients/update/{email}", payload)
 
-    async def delete_client(self, client_uuid):
-        # Полное удаление клиента на панели 3x-ui — именно это делает старый
-        # ключ нерабочим (в отличие от updateClient, id/subId остаются старыми).
+    async def delete_client(self, email):
+        # Полное удаление клиента на панели 3x-ui (3x-ui v3+: по email) — именно это делает
+        # старый ключ нерабочим (в отличие от update, id/subId остаются старыми).
         self._init_locks()
         async with self._write_lock:
-            return await self._api_post(f"/panel/api/inbounds/{self.inbound_id}/delClient/{client_uuid}")
+            return await self._api_post(f"/panel/api/clients/del/{email}?keepTraffic=0")
 
     async def reset_user_key(self, user_id, expire_timestamp):
         """Полностью пересоздаёт ключ пользователя: старый клиент удаляется
@@ -442,10 +493,8 @@ class VPNClient:
             except PanelError as e:
                 logging.error(f"3x-ui: не удалось проверить клиента {email}: {e}")
                 return ""
-            if existing and existing.get("id"):
-                deleted = await self._api_post(
-                    f"/panel/api/inbounds/{self.inbound_id}/delClient/{existing['id']}"
-                )
+            if existing:
+                deleted = await self._api_post(f"/panel/api/clients/del/{email}?keepTraffic=0")
                 if not deleted:
                     # Ответ на удаление мог не разобраться — смотрим, удалился ли клиент на деле.
                     try:
