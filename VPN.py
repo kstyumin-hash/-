@@ -17,6 +17,9 @@ import html
 import time
 import traceback
 import hmac
+import re
+import base64
+from urllib.parse import quote
 from collections import defaultdict
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -117,6 +120,9 @@ class VPNClient:
         self.inbound_id = int(os.environ.get("THREEXUI_INBOUND_ID", "1"))
         self.device_limit = int(os.environ.get("THREEXUI_DEVICE_LIMIT", "5"))
         self.sub_port = os.environ.get("THREEXUI_SUB_PORT", "")
+        # Полный публичный адрес подписки без subId, например https://host:2096/sub
+        # Если задан — используется вместо сборки из VPN_API_URL + SUB_PORT + SUB_PATH.
+        self.sub_base_url = os.environ.get("THREEXUI_SUB_BASE_URL", "").strip().rstrip("/")
         self.sub_path = os.environ.get("THREEXUI_SUB_PATH", "sub").strip("/")
         self.last_error = ""        # причина последнего отказа панели — попадает в уведомление владельцу
         self._session = None
@@ -281,6 +287,9 @@ class VPNClient:
                         last_err = f"HTTP {status}"
                     elif status in (401, 403, 404) or (status == 200 and data is None):
                         # Сессия отклонена (401/404) или вместо JSON пришла страница логина.
+                        # 404 с JSON-телом — обычное «не найдено» от самого API, перелогин не нужен.
+                        if status == 404 and isinstance(data, dict):
+                            return status, data
                         if relogged:
                             return status, data
                         relogged = True
@@ -326,6 +335,8 @@ class VPNClient:
             found = obj.get("client") if isinstance(obj.get("client"), dict) else obj
             if found.get("email") == email:
                 return found
+        elif isinstance(data, dict) and data.get("success") is False and status in (200, 404):
+            return None   # панель ответила «клиента нет» — запасной путь через inbound не нужен
         status, data = await self._request("GET", f"/panel/api/inbounds/get/{self.inbound_id}")
         if status != 200 or not isinstance(data, dict) or not data.get("success") or not data.get("obj"):
             raise PanelError(f"не удалось прочитать inbound {self.inbound_id} (HTTP {status})")
@@ -354,9 +365,60 @@ class VPNClient:
                 return str(client.get("subId") or "")
         return ""
 
+    @staticmethod
+    def _extract_links(data):
+        """Достаёт из ответа панели все ссылки подключения (vless://, vmess://, trojan://, ss://, hysteria2://)."""
+        prefixes = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
+        found = []
+
+        def walk(node):
+            if isinstance(node, str):
+                for line in node.splitlines():
+                    line = line.strip()
+                    if line.startswith(prefixes):
+                        found.append(line)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+            elif isinstance(node, dict):
+                for item in node.values():
+                    walk(item)
+
+        if isinstance(data, dict):
+            walk(data.get("obj"))
+        return found
+
+    async def get_client_by_sub_id(self, sub_id):
+        """Клиент по subId: GET /panel/api/clients/get/subId/{subId}. None, если не найден."""
+        status, data = await self._request("GET", f"/panel/api/clients/get/subId/{sub_id}")
+        if status != 200 or not isinstance(data, dict) or not data.get("success"):
+            return None
+        obj = data.get("obj")
+        if isinstance(obj, list):
+            obj = next((x for x in obj if isinstance(x, dict)), None)
+        if isinstance(obj, dict) and isinstance(obj.get("client"), dict):
+            obj = obj["client"]
+        return obj if isinstance(obj, dict) else None
+
+    async def fetch_client_links(self, email, sub_id):
+        """Ссылки подключения клиента, которые панель сама собирает с учётом настроек inbound'а."""
+        for path in (f"/panel/api/clients/links/{email}", f"/panel/api/clients/subLinks/{sub_id}"):
+            try:
+                status, data = await self._request("GET", path)
+            except PanelError:
+                continue
+            links = self._extract_links(data)
+            if links:
+                return links
+            snippet = " ".join(json.dumps(data, ensure_ascii=False).split())[:300] if data is not None else "-"
+            logging.warning(f"3x-ui GET {path}: ссылок в ответе нет (HTTP {status}): {snippet}")
+        return []
+
     def _build_sub_link(self, sub_id):
         if not sub_id:
             return ""
+        if self.sub_base_url:
+            return f"{self.sub_base_url}/{sub_id}"
         if self.sub_port:
             host = self.base_url.split("://")[-1].split("/")[0].split(":")[0]
             scheme = "https" if self.base_url.startswith("https") else "http"
@@ -404,7 +466,7 @@ class VPNClient:
         payload.setdefault("tgId", 0)
         return self._fix_tgid(payload)
 
-    async def _create_or_update_locked(self, user_id, expire_timestamp):
+    async def _create_or_update_locked(self, user_id, expire_timestamp, keep_sub_id=None):
         # Вызывать только под self._write_lock.
         email = f"user_{user_id}"
         expiry_ms = int(expire_timestamp) * 1000  # 3x-ui ждёт миллисекунды, не секунды
@@ -418,7 +480,7 @@ class VPNClient:
 
         if not existing:
             client_uuid = str(uuid.uuid4())
-            sub_id = uuid.uuid4().hex
+            sub_id = keep_sub_id or uuid.uuid4().hex
             # 3x-ui v3+: старый /inbounds/addClient удалён, клиентов создаёт /panel/api/clients/add.
             payload = {
                 "client": {
@@ -434,8 +496,6 @@ class VPNClient:
                 "inboundIds": [self.inbound_id],
             }
             if await self._api_post("/panel/api/clients/add", payload):
-                # Панель могла подставить свой subId — берём тот, что реально сохранился.
-                sub_id = (await self._read_sub_id(email)) or sub_id
                 return self._build_sub_link(sub_id)
             # Ответ мог потеряться, хотя клиент уже создан, — проверяем, а не плодим дубль.
             try:
@@ -493,6 +553,7 @@ class VPNClient:
             except PanelError as e:
                 logging.error(f"3x-ui: не удалось проверить клиента {email}: {e}")
                 return ""
+            keep_sub_id = (existing or {}).get("subId")
             if existing:
                 deleted = await self._api_post(f"/panel/api/clients/del/{email}?keepTraffic=0")
                 if not deleted:
@@ -505,8 +566,9 @@ class VPNClient:
                         # Старый клиент жив: «новый» ключ оказался бы тем же самым.
                         logging.error(f"3x-ui: не удалось удалить старого клиента {email}, сброс ключа отменён")
                         return ""
-            # После удаления создастся новый клиент — с новым uuid и subId.
-            return await self._create_or_update_locked(user_id, expire_timestamp)
+            # После удаления создастся новый клиент с новым uuid, но с прежним subId:
+            # ссылка подписки в Happ остаётся той же, достаточно нажать «обновить».
+            return await self._create_or_update_locked(user_id, expire_timestamp, keep_sub_id=keep_sub_id)
 
 vpn_client = VPNClient()
 
@@ -1661,14 +1723,16 @@ async def get_vless_key(callback: CallbackQuery):
 
     vless_key = user[11]
     # Старое/битое значение (например "1") не считаем ключом — выпускаем заново.
-    if not vless_key or not str(vless_key).startswith(("http://", "https://", "vless://")):
+    stale = bool(vpn_client.sub_base_url) and not str(vless_key or "").startswith(vpn_client.sub_base_url)
+    if stale or not vless_key or not str(vless_key).startswith(("http://", "https://", "vless://")):
         vless_key = ""
         try:
             expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
             timestamp = int(expire_dt.timestamp())
             vless_key = await vpn_client.create_or_update_user(user_id, timestamp)
-            await asyncio.to_thread(db.conn.execute, "UPDATE users SET vless_key=? WHERE id=?", (vless_key, user_id))
-            await asyncio.to_thread(db.conn.commit)
+            if vless_key:
+                await asyncio.to_thread(db.conn.execute, "UPDATE users SET vless_key=? WHERE id=?", (vless_key, user_id))
+                await asyncio.to_thread(db.conn.commit)
         except Exception as e:
             logging.error(f"Ошибка генерации ключа через API: {e}")
 
@@ -1747,8 +1811,8 @@ async def reset_vless_key(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"🔄 <b>Ключ обновлён!</b>\n\n"
-        f"Старый ключ отключён на сервере и больше не будет работать ни в одном приложении. "
-        f"Обновите ключ в Happ на новый:\n\n"
+        f"Старый ключ отключён на сервере. Ссылка подписки осталась прежней: "
+        f"в Happ просто нажмите кнопку обновления подписки.\n\n"
         f"<code>{new_key}</code>",
         reply_markup=vless_key_keyboard()
     )
@@ -2904,6 +2968,50 @@ async def finalize_platega_confirmed(transaction_id: str) -> bool:
         logging.error(f"Platega: сбой финализации {transaction_id}: {e}")
         return False
 
+async def handle_subscription(request):
+    """Публичная подписка через сервер бота (Render, https): отдаёт клиентам ссылки подключения,
+    полученные из панели 3x-ui. Нужна, когда порт подписки самой панели снаружи недоступен."""
+    sub_id = request.match_info.get("sub_id", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", sub_id):
+        return web.Response(status=404, text="not found")
+    try:
+        client = await vpn_client.get_client_by_sub_id(sub_id)
+        if not client or not client.get("email"):
+            return web.Response(status=404, text="not found")
+        links = await vpn_client.fetch_client_links(client["email"], sub_id)
+    except PanelError as e:
+        logging.error(f"Подписка {sub_id[:4]}…: панель недоступна: {e}")
+        return web.Response(status=502, text="panel unavailable")
+    if not links:
+        return web.Response(status=502, text="no links")
+
+    # Название сервера в Happ берётся из #имени ссылки; флаг страны — эмодзи в начале имени.
+    server_name = os.environ.get("SUB_SERVER_NAME", "🇵🇱 Польша").strip()
+    if server_name:
+        renamed = []
+        for i, link in enumerate(links, 1):
+            if link.startswith("vmess://"):   # у vmess имя внутри base64 — не трогаем
+                renamed.append(link)
+                continue
+            label = server_name if len(links) == 1 else f"{server_name} {i}"
+            renamed.append(link.split("#", 1)[0] + "#" + quote(label))
+        links = renamed
+
+    title = os.environ.get("SUB_PROFILE_TITLE", "Stopka VPN")
+    headers = {
+        "profile-title": "base64:" + base64.b64encode(title.encode("utf-8")).decode(),
+        "profile-update-interval": "1",
+        "Cache-Control": "no-store",
+    }
+    try:
+        expiry_ms = int(client.get("expiryTime") or 0)
+    except (TypeError, ValueError):
+        expiry_ms = 0
+    if expiry_ms > 0:
+        headers["subscription-userinfo"] = f"upload=0; download=0; total=0; expire={expiry_ms // 1000}"
+    body = base64.b64encode("\n".join(links).encode("utf-8")).decode()
+    return web.Response(text=body, content_type="text/plain", charset="utf-8", headers=headers)
+
 async def handle_ping(request):
     return web.Response(text="Bot is running", status=200)
 
@@ -2969,6 +3077,7 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
     app.router.add_get('/ping', handle_ping)
+    app.router.add_get('/sub/{sub_id}', handle_subscription)
     app.router.add_post('/platega/webhook', handle_platega_callback)
     
     runner = web.AppRunner(app)
