@@ -451,6 +451,18 @@ class VPNClient:
             logging.warning(f"3x-ui GET {path}: ссылок в ответе нет (HTTP {status}): {snippet}")
         return []
 
+    def happ_add_url(self, sub_link):
+        """Адрес страницы-переходника, которая открывает Happ с уже добавленной подпиской.
+        Пусто, если подписка отдаётся не через сервер бота."""
+        base = self.sub_base_url
+        if not base or not str(sub_link or "").startswith(base + "/"):
+            return ""
+        sub_id = str(sub_link)[len(base) + 1:].strip("/")
+        if not sub_id or "/" in sub_id:
+            return ""
+        root = base.rsplit("/", 1)[0]
+        return f"{root}/add/{sub_id}"
+
     def _build_sub_link(self, sub_id):
         if not sub_id:
             return ""
@@ -1416,11 +1428,13 @@ def back_keyboard():
         [InlineKeyboardButton(text="⬅ Назад", callback_data="profile", style="danger")]
     ])
 
-def vless_key_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🔄 Сбросить ключ", callback_data="reset_vless_key", style="danger")],
-        [btn("⬅ Назад", callback_data="profile", style="success")]
-    ])
+def vless_key_keyboard(add_url=None):
+    rows = []
+    if add_url:
+        rows.append([btn("📲 Добавить в Happ", url=add_url, style="success")])
+    rows.append([btn("🔄 Сбросить ключ", callback_data="reset_vless_key", style="danger")])
+    rows.append([btn("⬅ Назад", callback_data="profile", style="success")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def admin_back_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1808,7 +1822,7 @@ async def get_vless_key(callback: CallbackQuery):
         f"🔑 <b>Ваша подписка для Happ:</b>\n\n"
         f"Скопируйте ссылку и добавьте её в Happ как подписку:\n\n"
         f"<code>{vless_key}</code>",
-        reply_markup=vless_key_keyboard()
+        reply_markup=vless_key_keyboard(vpn_client.happ_add_url(vless_key))
     )
 
 KEY_RESET_COOLDOWN_HOURS = 24   # как часто можно перевыпускать ключ
@@ -1878,7 +1892,7 @@ async def reset_vless_key(callback: CallbackQuery):
         f"Старый ключ отключён на сервере. Ссылка подписки осталась прежней: "
         f"в Happ просто нажмите кнопку обновления подписки.\n\n"
         f"<code>{new_key}</code>",
-        reply_markup=vless_key_keyboard()
+        reply_markup=vless_key_keyboard(vpn_client.happ_add_url(new_key))
     )
 
 ############################################################
@@ -3032,21 +3046,81 @@ async def finalize_platega_confirmed(transaction_id: str) -> bool:
         logging.error(f"Platega: сбой финализации {transaction_id}: {e}")
         return False
 
+ADD_PAGE_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Добавить в Happ</title>
+<style>
+:root{--bg:#f4f6fa;--card:#fff;--fg:#1b2330;--mute:#667085;--btn:#2563eb;--btn2:#e8eefc;--btn2fg:#1d4ed8}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1420;--card:#171e2e;--fg:#e8edf7;--mute:#98a2b3;--btn:#3b82f6;--btn2:#22304d;--btn2fg:#9db8ff}}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--fg);font-family:-apple-system,Segoe UI,Roboto,sans-serif}
+.card{background:var(--card);border-radius:20px;padding:28px 22px;max-width:360px;width:calc(100% - 32px);text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.12)}
+h1{font-size:21px;margin:0 0 8px}p{color:var(--mute);font-size:15px;line-height:1.45;margin:0 0 18px}
+a.b,button.b{display:block;width:100%;box-sizing:border-box;border:0;border-radius:14px;padding:14px;font-size:16px;font-weight:600;text-decoration:none;cursor:pointer;margin-top:10px}
+.p{background:var(--btn);color:#fff}.s{background:var(--btn2);color:var(--btn2fg)}
+small{display:block;margin-top:16px;color:var(--mute);font-size:13px}
+</style></head><body><div class="card">
+<h1>Stopka VPN</h1>
+<p id="msg">Открываем Happ и добавляем подписку…</p>
+<a class="b p" id="open" href="#">Открыть Happ</a>
+<button class="b s" id="copy" type="button">Скопировать ссылку подписки</button>
+<a class="b s" href="https://apps.apple.com/app/happ-proxy-utility/id6504287215">Установить Happ (iPhone)</a>
+<a class="b s" href="https://play.google.com/store/search?q=Happ%20Proxy%20Utility&amp;c=apps">Установить Happ (Android)</a>
+<small>Если Happ не открылся сам, нажмите «Открыть Happ». Или скопируйте ссылку и вставьте её в Happ: «Добавить подписку» → «Из буфера».</small>
+</div>
+<script>
+var deeplink=__DEEPLINK__, subUrl=__SUBURL__;
+document.getElementById("open").href=deeplink;
+document.getElementById("copy").onclick=function(){
+  var b=this;
+  function ok(){b.textContent="Ссылка скопирована ✓";}
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(subUrl).then(ok,function(){prompt("Скопируйте ссылку:",subUrl);});}
+  else{prompt("Скопируйте ссылку:",subUrl);}
+};
+setTimeout(function(){window.location.href=deeplink;},300);
+setTimeout(function(){document.getElementById("msg").textContent="Если Happ не открылся, нажмите кнопку ниже.";},2500);
+</script></body></html>"""
+
+async def handle_add_page(request):
+    """Страница-переходник для кнопки «Добавить в Happ»: в Telegram нельзя открыть happ://
+    напрямую, поэтому кнопка ведёт сюда, а страница сама открывает Happ."""
+    sub_id = request.match_info.get("sub_id", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", sub_id):
+        return web.Response(status=404, text="not found")
+    sub_url = vpn_client._build_sub_link(sub_id)
+    if not str(sub_url).startswith("https://"):
+        return web.Response(status=404, text="not found")
+    page = (ADD_PAGE_HTML
+            .replace("__DEEPLINK__", json.dumps("happ://add/" + sub_url))
+            .replace("__SUBURL__", json.dumps(sub_url)))
+    return web.Response(text=page, content_type="text/html", charset="utf-8",
+                        headers={"Cache-Control": "no-store"})
+
+_sub_cache = {}   # sub_id -> (monotonic, body, headers): короткий кэш, чтобы Happ не ждал панель на каждом обновлении
+SUB_CACHE_TTL = 60
+
 async def handle_subscription(request):
     """Публичная подписка через сервер бота (Render, https): отдаёт клиентам ссылки подключения,
     полученные из панели 3x-ui. Нужна, когда порт подписки самой панели снаружи недоступен."""
     sub_id = request.match_info.get("sub_id", "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", sub_id):
         return web.Response(status=404, text="not found")
+    started = time.monotonic()
+    cached = _sub_cache.get(sub_id)
+    if cached and started - cached[0] < SUB_CACHE_TTL:
+        logging.info(f"Подписка {sub_id[:4]}…: отдана из кэша")
+        return web.Response(text=cached[1], content_type="text/plain", charset="utf-8", headers=cached[2])
     try:
         client = await vpn_client.get_client_by_sub_id(sub_id)
         if not client or not client.get("email"):
+            logging.warning(f"Подписка {sub_id[:4]}…: клиент с таким subId не найден на панели")
             return web.Response(status=404, text="not found")
         links = await vpn_client.fetch_client_links(client["email"], sub_id)
     except PanelError as e:
         logging.error(f"Подписка {sub_id[:4]}…: панель недоступна: {e}")
         return web.Response(status=502, text="panel unavailable")
     if not links:
+        logging.error(f"Подписка {sub_id[:4]}…: панель не вернула ссылок подключения")
         return web.Response(status=502, text="no links")
 
     # Название сервера в Happ берётся из #имени ссылки; флаг страны — эмодзи в начале имени.
@@ -3074,6 +3148,10 @@ async def handle_subscription(request):
     if expiry_ms > 0:
         headers["subscription-userinfo"] = f"upload=0; download=0; total=0; expire={expiry_ms // 1000}"
     body = base64.b64encode("\n".join(links).encode("utf-8")).decode()
+    if len(_sub_cache) > 500:
+        _sub_cache.clear()
+    _sub_cache[sub_id] = (time.monotonic(), body, headers)
+    logging.info(f"Подписка {sub_id[:4]}…: отдана за {time.monotonic() - started:.1f} с, ссылок: {len(links)}")
     return web.Response(text=body, content_type="text/plain", charset="utf-8", headers=headers)
 
 async def handle_ping(request):
@@ -3142,6 +3220,7 @@ async def start_web_server():
     app.router.add_get('/', handle_ping)
     app.router.add_get('/ping', handle_ping)
     app.router.add_get('/sub/{sub_id}', handle_subscription)
+    app.router.add_get('/add/{sub_id}', handle_add_page)
     app.router.add_post('/platega/webhook', handle_platega_callback)
     
     runner = web.AppRunner(app)
