@@ -262,6 +262,15 @@ class VPNClient:
         return await self._ensure_login(self._login_gen)
 
     async def _request(self, method, path, **kwargs):
+        started = time.monotonic()
+        try:
+            return await self._request_inner(method, path, **kwargs)
+        finally:
+            took = time.monotonic() - started
+            if took > 2:
+                logging.warning(f"3x-ui {method} {path}: медленный запрос, {took:.1f} с")
+
+    async def _request_inner(self, method, path, **kwargs):
         """Возвращает (status, data), data — разобранный JSON или None.
         Перелогинивается при отклонённой сессии, повторяет запрос при временных сбоях.
         Бросает PanelError, если панель так и не ответила."""
@@ -1713,6 +1722,11 @@ async def profile_callback(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "get_vless_key")
 async def get_vless_key(callback: CallbackQuery):
+    # Сразу снимаем «часики» с кнопки — дальше может быть долгий обмен с панелью.
+    try:
+        await callback.answer()
+    except Exception:
+        pass
     user_id = callback.from_user.id
     user = await asyncio.to_thread(db.get_user, user_id)
     days = calculate_days(user[3])
@@ -1722,30 +1736,48 @@ async def get_vless_key(callback: CallbackQuery):
         return
 
     vless_key = user[11]
-    # Старое/битое значение (например "1") не считаем ключом — выпускаем заново.
+    # Старое/битое значение (например "1") или ссылка не с текущего адреса подписки — выпускаем заново.
     stale = bool(vpn_client.sub_base_url) and not str(vless_key or "").startswith(vpn_client.sub_base_url)
     if stale or not vless_key or not str(vless_key).startswith(("http://", "https://", "vless://")):
         vless_key = ""
         try:
+            await callback.message.edit_text("⏳ <b>Готовим ключ…</b>\n\nЭто может занять до 30 секунд.")
+        except Exception:
+            pass
+        started = time.monotonic()
+        try:
             expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
             timestamp = int(expire_dt.timestamp())
-            vless_key = await vpn_client.create_or_update_user(user_id, timestamp)
+            vless_key = await asyncio.wait_for(vpn_client.create_or_update_user(user_id, timestamp), timeout=40)
             if vless_key:
                 await asyncio.to_thread(db.conn.execute, "UPDATE users SET vless_key=? WHERE id=?", (vless_key, user_id))
                 await asyncio.to_thread(db.conn.commit)
+        except asyncio.TimeoutError:
+            logging.error(f"get_vless_key: панель не ответила за 40 с (user {user_id})")
         except Exception as e:
             logging.error(f"Ошибка генерации ключа через API: {e}")
+        logging.info(f"get_vless_key: user {user_id}, ключ {'получен' if vless_key else 'НЕ получен'} за {time.monotonic() - started:.1f} с")
 
     if not vless_key:
-        vless_key = f"vless://error-check-api-connection@panel:443?encryption=none&security=reality#StopkaVPN"
+        await safe_edit(
+            callback,
+            "❌ <b>Не удалось получить ключ.</b>\n\n"
+            "Сервер сейчас не отвечает. Попробуйте ещё раз через минуту или напишите в поддержку.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [btn("🔁 Попробовать снова", callback_data="get_vless_key", style="primary")],
+                [btn("📨 Поддержка", url=SUPPORT_BOT_URL)],
+                [back_btn("profile")],
+            ])
+        )
+        return
 
-    await callback.message.edit_text(
-        f"🔑 <b>Ваш ключ VLESS для Happ:</b>\n\n"
-        f"Скопируйте эту строку и добавьте в приложение Happ:\n\n"
+    await safe_edit(
+        callback,
+        f"🔑 <b>Ваша подписка для Happ:</b>\n\n"
+        f"Скопируйте ссылку и добавьте её в Happ как подписку:\n\n"
         f"<code>{vless_key}</code>",
         reply_markup=vless_key_keyboard()
     )
-    await callback.answer()
 
 KEY_RESET_COOLDOWN_HOURS = 24   # как часто можно перевыпускать ключ
 
