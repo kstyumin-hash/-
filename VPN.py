@@ -3096,6 +3096,36 @@ async def handle_add_page(request):
     return web.Response(text=page, content_type="text/html", charset="utf-8",
                         headers={"Cache-Control": "no-store"})
 
+# Профиль маршрутизации Happ: российские сайты и приложения идут напрямую, минуя VPN.
+# Без geosite-тегов (несуществующий тег ломает запуск ядра) — только домены по суффиксу и geoip:ru.
+HAPP_RU_DIRECT_DOMAINS = [
+    "domain:ru", "domain:su", "domain:xn--p1ai",
+    "domain:vk.com", "domain:vk.me", "domain:vk-cdn.net", "domain:vkuser.net", "domain:userapi.com",
+    "domain:mycdn.me", "domain:yandex.com", "domain:yandex.net", "domain:yastatic.net",
+    "domain:2gis.com", "domain:sberbank.com",
+]
+HAPP_RU_PROFILE = {
+    "Name": "Stopka RU bypass",
+    "GlobalProxy": "true",
+    "RemoteDNSType": "DoH",
+    "RemoteDNSDomain": "https://cloudflare-dns.com/dns-query",
+    "RemoteDNSIP": "1.1.1.1",
+    "DomesticDNSType": "DoU",
+    "DomesticDNSDomain": "",
+    "DomesticDNSIP": "77.88.8.8",
+    "LastUpdated": "1794614400",   # поднимайте число, когда меняете правила: Happ обновит профиль
+    "DnsHosts": {"cloudflare-dns.com": "1.1.1.1"},
+    "DirectSites": HAPP_RU_DIRECT_DOMAINS,
+    "DirectIp": ["geoip:ru", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                 "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255"],
+    "DomainStrategy": "IPIfNonMatch",
+    "FakeDNS": "false",
+}
+
+def _happ_routing_header():
+    raw = json.dumps(HAPP_RU_PROFILE, ensure_ascii=False).encode("utf-8")
+    return "happ://routing/onadd/" + base64.b64encode(raw).decode()
+
 _sub_cache = {}   # sub_id -> (monotonic, body, headers): короткий кэш, чтобы Happ не ждал панель на каждом обновлении
 SUB_CACHE_TTL = 60
 
@@ -3141,6 +3171,19 @@ async def handle_subscription(request):
         "profile-update-interval": "1",
         "Cache-Control": "no-store",
     }
+    # Синий значок-самолётик в Happ: ссылка на бота (support-url)
+    support_url = os.environ.get("SUB_SUPPORT_URL", "https://t.me/StopkaVPN_bot").strip()
+    if support_url:
+        headers["support-url"] = support_url
+    # Описание подписки (Happ показывает не больше 200 символов)
+    announce = os.environ.get(
+        "SUB_ANNOUNCE", "Stopka VPN 🛡 Продление, вопросы и поддержка — в Telegram-боте @StopkaVPN_bot"
+    ).strip()[:200]
+    if announce:
+        headers["announce"] = "base64:" + base64.b64encode(announce.encode("utf-8")).decode()
+    # Обход VPN для российских сайтов и приложений
+    if os.environ.get("SUB_RU_BYPASS", "1") != "0":
+        headers["routing"] = _happ_routing_header()
     try:
         expiry_ms = int(client.get("expiryTime") or 0)
     except (TypeError, ValueError):
