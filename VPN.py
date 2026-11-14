@@ -129,6 +129,7 @@ class VPNClient:
         self._logged_in = False
         self._login_gen = 0        # растёт после каждого успешного логина
         self._csrf = ""           # CSRF-токен 3x-ui v3+ (нужен даже для /login)
+        self._unreachable_until = 0.0   # до этого момента (monotonic) панель считаем недоступной по сети
         self._login_lock = None    # локи создаются лениво — уже внутри event loop
         self._write_lock = None
 
@@ -177,6 +178,18 @@ class VPNClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    @staticmethod
+    def _is_connect_error(exc):
+        """Нет соединения с панелью вообще (таймаут подключения, отказ, нет маршрута)."""
+        types = [aiohttp.ClientConnectorError]
+        conn_timeout = getattr(aiohttp, "ConnectionTimeoutError", None)
+        if conn_timeout:
+            types.append(conn_timeout)
+        return isinstance(exc, tuple(types))
+
+    def _mark_unreachable(self, seconds=20):
+        self._unreachable_until = time.monotonic() + seconds
+
     async def _fetch_csrf(self, path="/"):
         """3x-ui v3+ отвечает 403 на POST без CSRF-токена (в т.ч. на /login).
         Токен лежит в <meta name="csrf-token"> страницы панели; запасной путь — GET /csrf-token."""
@@ -189,6 +202,9 @@ class VPNClient:
                     text = await resp.text()
             except Exception as e:
                 logging.warning(f"3x-ui: не удалось получить CSRF-токен с {p}: {e}")
+                if self._is_connect_error(e):
+                    self._mark_unreachable()
+                    return False   # панель не отвечает по сети — другие пути пробовать бессмысленно
                 continue
             if status != 200:
                 continue
@@ -217,7 +233,12 @@ class VPNClient:
         session = self._get_session()
         try:
             self._csrf = ""
-            if not await self._fetch_csrf("/"):
+            csrf_ok = await self._fetch_csrf("/")
+            if time.monotonic() < self._unreachable_until:
+                logging.error(f"3x-ui: нет соединения с панелью {self.base_url} — вход отложен")
+                self._logged_in = False
+                return
+            if not csrf_ok:
                 logging.warning("3x-ui: CSRF-токен на странице входа не найден (старая версия панели?) — логинимся без него")
             _hdrs = {"X-CSRF-Token": self._csrf} if self._csrf else {}
             async with session.post(
@@ -246,6 +267,8 @@ class VPNClient:
                     )
         except Exception as e:
             logging.error(f"Ошибка авторизации в 3x-ui: {e}")
+            if self._is_connect_error(e):
+                self._mark_unreachable()
             self._logged_in = False
 
     async def _ensure_login(self, seen_gen):
@@ -278,6 +301,9 @@ class VPNClient:
         relogged = False
         last_err = "нет ответа"
         for attempt in range(1, PANEL_ATTEMPTS + 1):
+            if time.monotonic() < self._unreachable_until:
+                last_err = "нет соединения с панелью"
+                break
             gen = self._login_gen
             if not self._logged_in and not await self._ensure_login(gen):
                 last_err = "не удалось авторизоваться"
@@ -309,6 +335,8 @@ class VPNClient:
                         return status, data
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_err = repr(e)
+                    if self._is_connect_error(e):
+                        self._mark_unreachable()
             logging.warning(f"3x-ui {method} {path}: {last_err} (попытка {attempt}/{PANEL_ATTEMPTS})")
             if attempt < PANEL_ATTEMPTS:
                 await asyncio.sleep(0.5 * attempt)
