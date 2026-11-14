@@ -488,20 +488,25 @@ class VPNClient:
             payload["tgId"] = int(tg) if tg.strip().isdigit() else 0
         return payload
 
+    # Поля, которые принимает /clients/update. Остальное из ответа /clients/get (числовой id записи,
+    # inboundIds, трафик, даты) в тело не кладём: панель ждёт id строкой и падает на числе.
+    _UPDATE_FIELDS = ("email", "totalGB", "expiryTime", "limitIp", "limitHwid", "tgId",
+                      "enable", "subId", "comment", "reset", "flow")
+
+    def _client_update_body(self, base, **changes):
+        body = {k: v for k, v in (base or {}).items() if k in self._UPDATE_FIELDS and v is not None}
+        body.update(changes)
+        body.setdefault("totalGB", 0)
+        body.setdefault("tgId", 0)
+        return self._fix_tgid(body)
+
     def _client_payload_v3(self, base, email, expiry_ms, sub_id):
-        # /clients/update ждёт полное тело клиента, а не патч: берём все поля существующего
-        # клиента и меняем только нужные.
-        payload = dict(base or {})
-        payload.update({
-            "email": email,
-            "enable": True,
-            "expiryTime": expiry_ms,
-            "limitIp": self.device_limit,
-            "subId": sub_id,
-        })
-        payload.setdefault("totalGB", 0)
-        payload.setdefault("tgId", 0)
-        return self._fix_tgid(payload)
+        # /clients/update ждёт полное тело клиента, а не патч: берём известные поля
+        # существующего клиента и меняем только нужные.
+        return self._client_update_body(
+            base, email=email, enable=True, expiryTime=expiry_ms,
+            limitIp=self.device_limit, subId=sub_id
+        )
 
     async def _create_or_update_locked(self, user_id, expire_timestamp, keep_sub_id=None):
         # Вызывать только под self._write_lock.
@@ -566,8 +571,7 @@ class VPNClient:
                 return False
             if not existing:
                 return False
-            payload = self._fix_tgid(dict(existing))
-            payload["enable"] = False
+            payload = self._client_update_body(existing, email=email, enable=False)
             return await self._api_post(f"/panel/api/clients/update/{email}", payload)
 
     async def delete_client(self, email):
