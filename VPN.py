@@ -3259,6 +3259,8 @@ async def handle_subscription(request):
     if traffic is None:
         logging.warning(f"Подписка {sub_id[:4]}…: трафик клиента не найден, поля записи: {sorted(client.keys())}")
         traffic = (0, 0)
+    else:
+        logging.info(f"Подписка {sub_id[:4]}…: трафик с панели — загружено {traffic[0]} Б, скачано {traffic[1]} Б")
     userinfo = f"upload={traffic[0]}; download={traffic[1]}; total=0"
     if expiry_ms > 0:
         userinfo += f"; expire={expiry_ms // 1000}"
