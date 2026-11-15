@@ -65,6 +65,18 @@ REFERRED_BONUS_DAYS = 3    # приглашённому — подарок за 
 ############################################################
 
 logging.basicConfig(level=logging.INFO)
+# Не засоряем логи: строка «Update ... is handled» на каждое действие и пинги аптайм-монитора.
+# Ошибки по-прежнему видны, запросы /sub, /add и webhook оплаты остаются в access-логе.
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+
+class _SkipPingAccessLog(logging.Filter):
+    _NOISE = ('"HEAD / HTTP', '"GET / HTTP', '"HEAD /ping HTTP', '"GET /ping HTTP', '"GET /favicon.ico')
+
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(part in msg for part in self._NOISE)
+
+logging.getLogger("aiohttp.access").addFilter(_SkipPingAccessLog())
 
 ############################################################
 # BOT
@@ -488,9 +500,7 @@ class VPNClient:
             obj = data.get("obj") if isinstance(data, dict) and data.get("success") else None
             stats = self._find_stats(obj, email)
             if stats:
-                if self._traffic_path != path:
-                    self._traffic_path = path
-                    logging.info(f"3x-ui: трафик клиентов берём с {path}")
+                self._traffic_path = path
                 return stats
             keys = sorted(obj.keys()) if isinstance(obj, dict) else type(obj).__name__
             tried.append(f"{path}: HTTP {status}, obj={keys}")
@@ -791,7 +801,6 @@ class PlategaClient:
                         data = None
                     elapsed = time.monotonic() - started
                     if resp.status == 200 and isinstance(data, dict):
-                        logging.info(f"Platega create_transaction OK за {elapsed:.1f}с (попытка {attempt})")
                         return data
                     logging.error(f"Platega create_transaction ошибка {resp.status} за {elapsed:.1f}с (попытка {attempt}): {data}")
                     # 200 с неразборчивым телом, 5xx, 408, 429 — временные, остальное — нет
@@ -977,7 +986,7 @@ class PGConnection:
                     self._pool.putconn(conn, close=True)
                 except:
                     pass
-                logging.warning(f"БД: мёртвое соединение из пула, пересоздаю и повторяю запрос (попытка {attempt + 1}/{max_attempts})")
+                logging.debug(f"БД: мёртвое соединение из пула, пересоздаю и повторяю запрос (попытка {attempt + 1}/{max_attempts})")
                 continue
             except Exception:
                 try:
@@ -1055,12 +1064,6 @@ class Database:
             # Всех, кто уже принял условия (грандфазеринг выше) — считаем
             # уже использовавшими пробный период, иначе им внезапно перевыдаст.
             self.conn.execute("UPDATE users SET trial_used=1 WHERE accepted_terms=1")
-        logging.info(f"create_tables(): миграция trial_used — column_existed_before={trial_col_existed}")
-        diag = self.conn.execute("""
-            SELECT column_name, ordinal_position FROM information_schema.columns
-            WHERE table_name='users' ORDER BY ordinal_position
-        """).fetchall()
-        logging.info(f"create_tables(): текущие колонки users по порядку = {diag}")
         
         self.conn.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes(
@@ -1510,7 +1513,7 @@ def back_keyboard():
 def vless_key_keyboard(add_url=None):
     rows = []
     if add_url:
-        rows.append([btn("📲 Добавить в Happ", url=add_url, style="success")])
+        rows.append([btn("📲 Добавить в Happ / INCY", url=add_url, style="success")])
     rows.append([btn("🔄 Сбросить ключ", callback_data="reset_vless_key", style="danger")])
     rows.append([btn("⬅ Назад", callback_data="profile", style="success")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1814,7 +1817,6 @@ async def accept_terms(callback: CallbackQuery):
             alert_text = f"🎉 Вам начислено {trial_days} {_days_word(trial_days)} VPN!"
             if referred:
                 alert_text += f"\n(включая +{REFERRED_BONUS_DAYS} {_days_word(REFERRED_BONUS_DAYS)} за приглашение)"
-            logging.info(f"accept_terms: user_id={user_id} — пробный период выдан, trial_used выставлен в 1 (rowcount=1)")
         else:
             # Пробный период уже был использован раньше (или гонка — его только что
             # выдал параллельный запрос) — повторно дни не начисляем, просто
@@ -1869,7 +1871,6 @@ async def get_vless_key(callback: CallbackQuery):
             await callback.message.edit_text("⏳ <b>Готовим ключ…</b>\n\nЭто может занять до 30 секунд.")
         except Exception:
             pass
-        started = time.monotonic()
         try:
             expire_dt = datetime.strptime(user[3], "%Y-%m-%d %H:%M:%S")
             timestamp = int(expire_dt.timestamp())
@@ -1881,7 +1882,6 @@ async def get_vless_key(callback: CallbackQuery):
             logging.error(f"get_vless_key: панель не ответила за 40 с (user {user_id})")
         except Exception as e:
             logging.error(f"Ошибка генерации ключа через API: {e}")
-        logging.info(f"get_vless_key: user {user_id}, ключ {'получен' if vless_key else 'НЕ получен'} за {time.monotonic() - started:.1f} с")
 
     if not vless_key:
         await safe_edit(
@@ -1898,8 +1898,8 @@ async def get_vless_key(callback: CallbackQuery):
 
     await safe_edit(
         callback,
-        f"🔑 <b>Ваша подписка для Happ:</b>\n\n"
-        f"Скопируйте ссылку и добавьте её в Happ как подписку:\n\n"
+        f"🔑 <b>Ваша подписка для Happ и INCY:</b>\n\n"
+        f"Нажмите кнопку ниже или скопируйте ссылку и добавьте её в приложение как подписку:\n\n"
         f"<code>{vless_key}</code>",
         reply_markup=vless_key_keyboard(vpn_client.happ_add_url(vless_key))
     )
@@ -1969,7 +1969,7 @@ async def reset_vless_key(callback: CallbackQuery):
     await callback.message.edit_text(
         f"🔄 <b>Ключ обновлён!</b>\n\n"
         f"Старый ключ отключён на сервере. Ссылка подписки осталась прежней: "
-        f"в Happ просто нажмите кнопку обновления подписки.\n\n"
+        f"в приложении просто нажмите кнопку обновления подписки.\n\n"
         f"<code>{new_key}</code>",
         reply_markup=vless_key_keyboard(vpn_client.happ_add_url(new_key))
     )
@@ -3147,55 +3147,230 @@ async def finalize_platega_confirmed(transaction_id: str) -> bool:
         logging.error(f"Platega: сбой финализации {transaction_id}: {e}")
         return False
 
-ADD_PAGE_HTML = """<!doctype html>
+# ---------------------------------------------------------------------------
+# Страница подписки (открывается в браузере) и определение приложения-клиента
+# ---------------------------------------------------------------------------
+# Приложения, которые скачивают подписку: им отдаём конфиг, а не страницу.
+SUB_APP_UA_TOKENS = (
+    "happ", "incy", "v2ray", "clash", "sing-box", "singbox", "hiddify", "streisand", "shadowrocket",
+    "nekobox", "nekoray", "karing", "v2box", "foxray", "loon", "quantumult", "surge", "stash",
+    "flclash", "mihomo", "go-http-client", "okhttp", "curl", "python", "wget",
+)
+
+def _client_kind(user_agent):
+    """'incy' / 'happ' / 'other' — по User-Agent приложения (INCY: INCY/<версия>/<платформа>)."""
+    ua = (user_agent or "").lower()
+    if "incy/" in ua:
+        return "incy"
+    if "happ" in ua:
+        return "happ"
+    return "other"
+
+def _is_browser_request(request):
+    """Запрос из браузера (страница подписки), а не от приложения (конфиг). ?raw=1 — всегда конфиг."""
+    if request.query.get("raw"):
+        return False
+    ua = request.headers.get("User-Agent", "").lower()
+    if "mozilla" not in ua or any(token in ua for token in SUB_APP_UA_TOKENS):
+        return False
+    accept = request.headers.get("Accept", "").lower()
+    return not accept or "text/html" in accept
+
+def _fmt_bytes(value):
+    n = float(max(int(value or 0), 0))
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if n < 1024 or unit == "ТБ":
+            if unit == "Б":
+                return f"{int(n)} {unit}"
+            return f"{n:.2f}".rstrip("0").rstrip(".") + f" {unit}"
+        n /= 1024
+
+def _page_tz():
+    from datetime import timezone as _timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(os.environ.get("SUB_PAGE_TZ", "Europe/Moscow"))
+    except Exception:
+        return _timezone(timedelta(hours=3))
+
+def _app_icon(env_name, letter, color_a, color_b):
+    """Значок приложения: картинка по https-ссылке из переменной, иначе цветной значок с буквой."""
+    url = os.environ.get(env_name, "").strip()
+    if url.startswith("https://"):
+        return f'<img class="ico" src="{html.escape(url, quote=True)}" alt="">'
+    return f'<span class="ico" style="background:linear-gradient(135deg,{color_a},{color_b})">{letter}</span>'
+
+SUB_PAGE_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Добавить в Happ</title>
+<meta name="color-scheme" content="light dark"><meta name="robots" content="noindex">
+<title>Stopka VPN — подписка</title>
 <style>
-:root{--bg:#f4f6fa;--card:#fff;--fg:#1b2330;--mute:#667085;--btn:#2563eb;--btn2:#e8eefc;--btn2fg:#1d4ed8}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1420;--card:#171e2e;--fg:#e8edf7;--mute:#98a2b3;--btn:#3b82f6;--btn2:#22304d;--btn2fg:#9db8ff}}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--fg);font-family:-apple-system,Segoe UI,Roboto,sans-serif}
-.card{background:var(--card);border-radius:20px;padding:28px 22px;max-width:360px;width:calc(100% - 32px);text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.12)}
-h1{font-size:21px;margin:0 0 8px}p{color:var(--mute);font-size:15px;line-height:1.45;margin:0 0 18px}
-a.b,button.b{display:block;width:100%;box-sizing:border-box;border:0;border-radius:14px;padding:14px;font-size:16px;font-weight:600;text-decoration:none;cursor:pointer;margin-top:10px}
-.p{background:var(--btn);color:#fff}.s{background:var(--btn2);color:var(--btn2fg)}
-small{display:block;margin-top:16px;color:var(--mute);font-size:13px}
-</style></head><body><div class="card">
-<h1>Stopka VPN</h1>
-<p id="msg">Открываем Happ и добавляем подписку…</p>
-<a class="b p" id="open" href="#">Открыть Happ</a>
-<button class="b s" id="copy" type="button">Скопировать ссылку подписки</button>
-<a class="b s" href="https://apps.apple.com/app/happ-proxy-utility/id6504287215">Установить Happ (iPhone)</a>
-<a class="b s" href="https://play.google.com/store/search?q=Happ%20Proxy%20Utility&amp;c=apps">Установить Happ (Android)</a>
-<small>Если Happ не открылся сам, нажмите «Открыть Happ». Или скопируйте ссылку и вставьте её в Happ: «Добавить подписку» → «Из буфера».</small>
+:root{--bg:#f2f4f9;--card:#fff;--fg:#182033;--mute:#6b7690;--line:#e6e9f2;--acc:#2f6bff;--ok:#15a05b;--bad:#e5484d;--tile:#f5f7fc}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1320;--card:#161d2e;--fg:#e9eefb;--mute:#93a0bd;--line:#24304a;--acc:#5b8cff;--ok:#38c98a;--bad:#ff6b70;--tile:#1c2640}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+.wrap{max-width:460px;margin:0 auto;padding:18px 14px 28px}
+.top{display:flex;align-items:center;gap:12px;margin:6px 4px 16px}
+.logo{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#2f6bff,#8b5cf6);color:#fff;font-weight:800;font-size:20px;display:flex;align-items:center;justify-content:center}
+.top h1{font-size:19px;margin:0}.top p{margin:2px 0 0;font-size:13px;color:var(--mute)}
+.card{background:var(--card);border-radius:20px;padding:16px;margin-bottom:14px;box-shadow:0 6px 22px rgba(15,25,60,.08)}
+.row{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid var(--line);font-size:15px}
+.row:last-of-type{border-bottom:0}.row span:first-child{color:var(--mute)}.row b{font-weight:600;text-align:right}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+.bar{height:8px;border-radius:99px;background:var(--line);overflow:hidden;margin-top:4px}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#2f6bff,#8b5cf6);border-radius:99px}
+h2{font-size:16px;margin:0 0 12px}
+.tabs{display:flex;gap:6px;background:var(--tile);padding:4px;border-radius:14px;margin-bottom:12px}
+.tab{flex:1;border:0;background:transparent;color:var(--mute);padding:10px;border-radius:11px;font-size:15px;font-weight:600;cursor:pointer}
+.tab.on{background:var(--card);color:var(--fg);box-shadow:0 2px 8px rgba(15,25,60,.1)}
+.pane{display:none}.pane.on{display:block}
+.tile{display:flex;align-items:center;gap:12px;padding:12px;border-radius:16px;background:var(--tile);color:var(--fg);text-decoration:none;margin-bottom:10px}
+.tile:active{opacity:.8}
+.ico{width:46px;height:46px;border-radius:13px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:22px;flex:none;object-fit:cover}
+.nm{flex:1;display:flex;flex-direction:column;min-width:0}.nm b{font-size:16px}.nm i{font-style:normal;font-size:13px;color:var(--mute)}
+.go{font-size:26px;color:var(--mute)}
+.dl{font-size:13px;color:var(--mute);margin:2px 2px 4px}.dl a{color:var(--acc);text-decoration:none}
+.btn{display:block;width:100%;border:0;border-radius:14px;padding:14px;font-size:15px;font-weight:600;text-align:center;text-decoration:none;cursor:pointer;margin-top:8px}
+.b1{background:var(--tile);color:var(--fg)}.b2{background:var(--acc);color:#fff}
+.hint{font-size:12.5px;color:var(--mute);line-height:1.45;margin:10px 2px 0}
+.warn{background:rgba(229,72,77,.12);color:var(--bad);border-radius:14px;padding:12px;font-size:14px;margin-bottom:12px;line-height:1.4}
+.foot{text-align:center;font-size:13px;color:var(--mute);margin-top:6px}.foot a{color:var(--acc);text-decoration:none}
+</style></head><body><div class="wrap">
+<div class="top"><div class="logo">S</div><div><h1>Stopka VPN</h1><p>Страница подписки</p></div></div>
+
+<div class="card">
+<div class="row"><span>ID пользователя</span><b>__USER__</b></div>
+<div class="row"><span>Статус</span><b class="__STATUS_CLASS__">__STATUS__</b></div>
+<div class="row"><span>Подписка истекает</span><b>__EXPIRY__</b></div>
+<div class="row"><span>Использовано трафика</span><b>__USED__ из __TOTAL__</b></div>
+__BAR__
+</div>
+
+<div class="card">
+__WARN__
+<h2>Добавить подписку</h2>
+<div class="tabs"><button class="tab" data-tab="android" type="button">Android</button><button class="tab" data-tab="ios" type="button">iOS</button></div>
+<div class="pane" data-pane="android">
+<a class="tile" href="__HAPP__">__HAPP_ICON__<span class="nm"><b>Happ</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
+<a class="tile" href="__INCY__">__INCY_ICON__<span class="nm"><b>INCY</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
+<div class="dl">Нет приложения? Скачать: <a href="__HAPP_ANDROID__">Happ</a> · <a href="__INCY_SITE__">INCY</a></div>
+</div>
+<div class="pane" data-pane="ios">
+<a class="tile" href="__HAPP__">__HAPP_ICON__<span class="nm"><b>Happ</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
+<a class="tile" href="__INCY__">__INCY_ICON__<span class="nm"><b>INCY</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
+<div class="dl">Нет приложения? Скачать: <a href="__HAPP_IOS__">Happ</a> · <a href="__INCY_SITE__">INCY</a></div>
+</div>
+<button class="btn b1" id="copy" type="button">Скопировать ссылку подписки</button>
+<p class="hint">Если приложение не открылось, откройте эту страницу в обычном браузере (в Telegram: ⋮ → «Открыть в браузере») или скопируйте ссылку и вставьте её в приложение: «Добавить подписку» → «Из буфера».</p>
+</div>
+
+<div class="foot">Вопросы и продление — <a href="__SUPPORT__">Telegram-бот</a></div>
 </div>
 <script>
-var deeplink=__DEEPLINK__, subUrl=__SUBURL__;
-document.getElementById("open").href=deeplink;
-document.getElementById("copy").onclick=function(){
-  var b=this;
-  function ok(){b.textContent="Ссылка скопирована ✓";}
-  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(subUrl).then(ok,function(){prompt("Скопируйте ссылку:",subUrl);});}
-  else{prompt("Скопируйте ссылку:",subUrl);}
-};
-setTimeout(function(){window.location.href=deeplink;},300);
-setTimeout(function(){document.getElementById("msg").textContent="Если Happ не открылся, нажмите кнопку ниже.";},2500);
+(function(){
+  var subUrl=__SUBURL__;
+  var ua=navigator.userAgent||"";
+  var ios=/iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1);
+  var tabs=document.querySelectorAll(".tab"),panes=document.querySelectorAll(".pane");
+  function show(name){
+    for(var i=0;i<tabs.length;i++){tabs[i].className="tab"+(tabs[i].getAttribute("data-tab")===name?" on":"");}
+    for(var j=0;j<panes.length;j++){panes[j].className="pane"+(panes[j].getAttribute("data-pane")===name?" on":"");}
+  }
+  for(var k=0;k<tabs.length;k++){tabs[k].onclick=function(){show(this.getAttribute("data-tab"));};}
+  show(ios?"ios":"android");
+  var copy=document.getElementById("copy");
+  copy.onclick=function(){
+    function ok(){copy.textContent="Ссылка скопирована ✓";}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(subUrl).then(ok,function(){prompt("Скопируйте ссылку:",subUrl);});}
+    else{prompt("Скопируйте ссылку:",subUrl);}
+  };
+})();
 </script></body></html>"""
 
+def render_sub_page(sub_id, client, traffic):
+    """HTML-страница подписки: статус, срок, трафик и выбор устройства/приложения."""
+    esc = lambda value: html.escape(str(value), quote=True)
+    sub_url = vpn_client._build_sub_link(sub_id)
+    email = str(client.get("email") or "")
+    match = re.fullmatch(r"user_(\d+)", email)
+    user_label = match.group(1) if match else email
+
+    used = (int(traffic[0] or 0) + int(traffic[1] or 0)) if traffic else 0
+    try:
+        total = int(client.get("totalGB") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        expiry_ms = int(client.get("expiryTime") or 0)
+    except (TypeError, ValueError):
+        expiry_ms = 0
+
+    now = time.time()
+    active = bool(client.get("enable", True)) and (expiry_ms <= 0 or expiry_ms / 1000 > now)
+    if expiry_ms > 0:
+        left = expiry_ms / 1000 - now
+        stamp = datetime.fromtimestamp(expiry_ms / 1000, _page_tz()).strftime("%d.%m.%Y, %H:%M")
+        if left <= 0:
+            expiry_text = f"{stamp} (срок истёк)"
+        elif left < 86400:
+            expiry_text = f"{stamp} (меньше суток)"
+        else:
+            days = int(left // 86400)
+            expiry_text = f"{stamp} ({days} {_days_word(days)})"
+    else:
+        expiry_text = "Бессрочно"
+
+    bar = ""
+    if total > 0:
+        percent = min(100, int(used * 100 / total))
+        bar = f'<div class="bar"><i style="width:{percent}%"></i></div>'
+
+    warn = "" if active else '<div class="warn">Подписка не активна. Продлите её в Telegram-боте, чтобы VPN снова заработал.</div>'
+    support = os.environ.get("SUB_SUPPORT_URL", "https://t.me/StopkaVPN_bot").strip() or "https://t.me/StopkaVPN_bot"
+
+    replacements = {
+        "__USER__": esc(user_label),
+        "__STATUS_CLASS__": "ok" if active else "bad",
+        "__STATUS__": "Активна" if active else "Не активна",
+        "__EXPIRY__": esc(expiry_text),
+        "__USED__": esc(_fmt_bytes(used)),
+        "__TOTAL__": esc(_fmt_bytes(total)) if total > 0 else "∞",
+        "__BAR__": bar,
+        "__WARN__": warn,
+        "__HAPP__": esc("happ://add/" + sub_url),
+        "__INCY__": esc("incy://import/" + sub_url),
+        "__HAPP_ICON__": _app_icon("HAPP_ICON_URL", "H", "#3b82f6", "#1d4ed8"),
+        "__INCY_ICON__": _app_icon("INCY_ICON_URL", "I", "#8b5cf6", "#6d28d9"),
+        "__HAPP_IOS__": "https://apps.apple.com/app/happ-proxy-utility/id6504287215",
+        "__HAPP_ANDROID__": "https://play.google.com/store/search?q=Happ%20Proxy%20Utility&amp;c=apps",
+        "__INCY_SITE__": "https://incy.cc",
+        "__SUPPORT__": esc(support),
+        "__SUBURL__": json.dumps(sub_url),
+    }
+    page = SUB_PAGE_HTML
+    for key, value in replacements.items():
+        page = page.replace(key, value)
+    return page
+
+async def _sub_page_response(sub_id):
+    try:
+        client = await vpn_client.get_client_by_sub_id(sub_id)
+        if not client or not client.get("email"):
+            return web.Response(status=404, text="not found")
+        traffic = (await vpn_client.get_client_traffic(client)) or (0, 0)
+    except PanelError as e:
+        logging.error(f"Страница подписки {sub_id[:4]}…: панель недоступна: {e}")
+        return web.Response(status=502, text="Сервер временно недоступен. Попробуйте позже.",
+                            content_type="text/plain", charset="utf-8")
+    return web.Response(text=render_sub_page(sub_id, client, traffic), content_type="text/html",
+                        charset="utf-8", headers={"Cache-Control": "no-store"})
+
 async def handle_add_page(request):
-    """Страница-переходник для кнопки «Добавить в Happ»: в Telegram нельзя открыть happ://
-    напрямую, поэтому кнопка ведёт сюда, а страница сама открывает Happ."""
+    """Страница подписки для кнопки «Добавить в Happ / INCY» и значка «i» в Happ (всегда HTML)."""
     sub_id = request.match_info.get("sub_id", "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", sub_id):
         return web.Response(status=404, text="not found")
-    sub_url = vpn_client._build_sub_link(sub_id)
-    if not str(sub_url).startswith("https://"):
-        return web.Response(status=404, text="not found")
-    page = (ADD_PAGE_HTML
-            .replace("__DEEPLINK__", json.dumps("happ://add/" + sub_url))
-            .replace("__SUBURL__", json.dumps(sub_url)))
-    return web.Response(text=page, content_type="text/html", charset="utf-8",
-                        headers={"Cache-Control": "no-store"})
+    return await _sub_page_response(sub_id)
 
 # Профиль маршрутизации Happ: российские сайты и приложения идут напрямую, минуя VPN.
 # Без geosite-тегов (несуществующий тег ломает запуск ядра) — только домены по суффиксу и geoip:ru.
@@ -3223,9 +3398,11 @@ HAPP_RU_PROFILE = {
     "FakeDNS": "false",
 }
 
-def _happ_routing_header():
+def _routing_header(kind="happ"):
     raw = json.dumps(HAPP_RU_PROFILE, ensure_ascii=False).encode("utf-8")
-    return "happ://routing/onadd/" + base64.b64encode(raw).decode()
+    encoded = base64.b64encode(raw).decode()
+    # INCY принимает base64 профиля прямо в заголовке, Happ — ссылку happ://routing/onadd/...
+    return encoded if kind == "incy" else "happ://routing/onadd/" + encoded
 
 def _invalidate_sub_cache():
     """После любого изменения срока на панели — чтобы «обновить» в Happ сразу показало новые дни."""
@@ -3240,10 +3417,14 @@ async def handle_subscription(request):
     sub_id = request.match_info.get("sub_id", "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", sub_id):
         return web.Response(status=404, text="not found")
+    # Из браузера открываем страницу подписки, приложениям (Happ, INCY и др.) отдаём конфиг.
+    if _is_browser_request(request):
+        return await _sub_page_response(sub_id)
+    kind = _client_kind(request.headers.get("User-Agent", ""))
+    cache_key = f"{sub_id}:{kind}"
     started = time.monotonic()
-    cached = _sub_cache.get(sub_id)
+    cached = _sub_cache.get(cache_key)
     if cached and started - cached[0] < SUB_CACHE_TTL:
-        logging.info(f"Подписка {sub_id[:4]}…: отдана из кэша")
         return web.Response(text=cached[1], content_type="text/plain", charset="utf-8", headers=cached[2])
     try:
         client = await vpn_client.get_client_by_sub_id(sub_id)
@@ -3288,17 +3469,23 @@ async def handle_subscription(request):
         headers["announce"] = "base64:" + base64.b64encode(announce.encode("utf-8")).decode()
     # Обход VPN для российских сайтов и приложений
     if os.environ.get("SUB_RU_BYPASS", "1") != "0":
-        headers["routing"] = _happ_routing_header()
+        headers["routing"] = _routing_header(kind)
+    # Значок «i» слева в Happ / «сайт» в INCY открывает страницу подписки
+    page_url = vpn_client.happ_add_url(vpn_client._build_sub_link(sub_id))
+    if page_url:
+        headers["profile-web-page-url"] = page_url
+    # INCY умеет показывать отдельное описание подписки
+    if kind == "incy":
+        description = os.environ.get(
+            "SUB_DESCRIPTION", "Быстрый и стабильный VPN. Продление и поддержка — в Telegram-боте"
+        ).strip()[:150]
+        if description:
+            headers["profile-description"] = "base64:" + base64.b64encode(description.encode("utf-8")).decode()
     try:
         expiry_ms = int(client.get("expiryTime") or 0)
     except (TypeError, ValueError):
         expiry_ms = 0
-    traffic = await vpn_client.get_client_traffic(client)
-    if traffic is None:
-        logging.warning(f"Подписка {sub_id[:4]}…: трафик клиента не найден, поля записи: {sorted(client.keys())}")
-        traffic = (0, 0)
-    else:
-        logging.info(f"Подписка {sub_id[:4]}…: трафик с панели — загружено {traffic[0]} Б, скачано {traffic[1]} Б")
+    traffic = (await vpn_client.get_client_traffic(client)) or (0, 0)
     userinfo = f"upload={traffic[0]}; download={traffic[1]}; total=0"
     if expiry_ms > 0:
         userinfo += f"; expire={expiry_ms // 1000}"
@@ -3306,8 +3493,7 @@ async def handle_subscription(request):
     body = base64.b64encode("\n".join(links).encode("utf-8")).decode()
     if len(_sub_cache) > 500:
         _sub_cache.clear()
-    _sub_cache[sub_id] = (time.monotonic(), body, headers)
-    logging.info(f"Подписка {sub_id[:4]}…: отдана за {time.monotonic() - started:.1f} с, ссылок: {len(links)}")
+    _sub_cache[cache_key] = (time.monotonic(), body, headers)
     return web.Response(text=body, content_type="text/plain", charset="utf-8", headers=headers)
 
 async def handle_ping(request):
@@ -3384,7 +3570,6 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logging.info(f"🌐 Веб-сервер запущен на порту {PORT}")
-    logging.info("VPN.py: версия 2026-10-31 (заголовки 3x-ui, лог 403)")
 
 ############################################################
 # START BOT
