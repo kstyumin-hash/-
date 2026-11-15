@@ -134,6 +134,7 @@ class VPNClient:
         self._logged_in = False
         self._login_gen = 0        # растёт после каждого успешного логина
         self._csrf = ""           # CSRF-токен 3x-ui v3+ (нужен даже для /login)
+        self._traffic_path = None       # адрес, с которого удалось прочитать трафик клиентов
         self._unreachable_until = 0.0   # до этого момента (monotonic) панель считаем недоступной по сети
         self._login_lock = None    # локи создаются лениво — уже внутри event loop
         self._write_lock = None
@@ -443,6 +444,26 @@ class VPNClient:
                     continue
         return None
 
+    @classmethod
+    def _find_stats(cls, obj, email):
+        """Ищет (up, down) нужного клиента в ответе панели: запись клиента, список статистики
+        или inbound с полем clientStats."""
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict) and item.get("email") == email:
+                    return cls._traffic_from(item)
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if obj.get("email") == email:
+            return cls._traffic_from(obj)
+        for key in ("clientStats", "clientTraffics", "clients", "list", "items"):
+            if isinstance(obj.get(key), list):
+                found = cls._find_stats(obj[key], email)
+                if found:
+                    return found
+        return None
+
     async def get_client_traffic(self, client):
         """Использованный трафик клиента для строки subscription-userinfo в Happ."""
         found = self._traffic_from(client)
@@ -451,12 +472,29 @@ class VPNClient:
         email = (client or {}).get("email")
         if not email:
             return None
-        try:
-            status, data = await self._request("GET", f"/panel/api/inbounds/getClientTraffics/{email}")
-        except PanelError:
-            return None
-        if status == 200 and isinstance(data, dict) and data.get("success"):
-            return self._traffic_from(data.get("obj"))
+        paths = [self._traffic_path] if getattr(self, "_traffic_path", None) else [
+            f"/panel/api/inbounds/get/{self.inbound_id}",   # у inbound есть clientStats с up/down клиентов
+            f"/panel/api/inbounds/getClientTraffics/{email}",
+            f"/panel/api/clients/traffic/{email}",
+            "/panel/api/inbounds/list",
+        ]
+        tried = []
+        for path in paths:
+            try:
+                status, data = await self._request("GET", path)
+            except PanelError:
+                tried.append(f"{path}: нет ответа")
+                continue
+            obj = data.get("obj") if isinstance(data, dict) and data.get("success") else None
+            stats = self._find_stats(obj, email)
+            if stats:
+                if self._traffic_path != path:
+                    self._traffic_path = path
+                    logging.info(f"3x-ui: трафик клиентов берём с {path}")
+                return stats
+            keys = sorted(obj.keys()) if isinstance(obj, dict) else type(obj).__name__
+            tried.append(f"{path}: HTTP {status}, obj={keys}")
+        logging.warning("3x-ui: трафик клиента не найден ни на одном адресе: " + " | ".join(tried))
         return None
 
     async def get_client_by_sub_id(self, sub_id):
