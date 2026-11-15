@@ -19,7 +19,7 @@ import traceback
 import hmac
 import re
 import base64
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from collections import defaultdict
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -122,7 +122,12 @@ class VPNClient:
         self.sub_port = os.environ.get("THREEXUI_SUB_PORT", "")
         # Полный публичный адрес подписки без subId, например https://host:2096/sub
         # Если задан — используется вместо сборки из VPN_API_URL + SUB_PORT + SUB_PATH.
-        self.sub_base_url = os.environ.get("THREEXUI_SUB_BASE_URL", "").strip().rstrip("/")
+        _base = os.environ.get("THREEXUI_SUB_BASE_URL", "").strip().rstrip("/")
+        if _base and not _base.startswith(("http://", "https://")):
+            _base = "https://" + _base          # забыли схему — считаем https
+        if _base and urlparse(_base).path in ("", "/"):
+            _base += "/sub"                     # указали только домен — путь /sub добавим сами
+        self.sub_base_url = _base
         self.sub_path = os.environ.get("THREEXUI_SUB_PATH", "sub").strip("/")
         self.last_error = ""        # причина последнего отказа панели — попадает в уведомление владельцу
         self._session = None
@@ -516,9 +521,13 @@ class VPNClient:
         # /clients/update ждёт полное тело клиента, а не патч: берём известные поля
         # существующего клиента и меняем только нужные.
         return self._client_update_body(
-            base, email=email, enable=True, expiryTime=expiry_ms,
+            base, email=email, enable=self._not_expired(expiry_ms), expiryTime=expiry_ms,
             limitIp=self.device_limit, subId=sub_id
         )
+
+    @staticmethod
+    def _not_expired(expiry_ms):
+        return not expiry_ms or int(expiry_ms) > int(time.time() * 1000)
 
     async def _create_or_update_locked(self, user_id, expire_timestamp, keep_sub_id=None):
         # Вызывать только под self._write_lock.
@@ -541,7 +550,7 @@ class VPNClient:
                     "id": client_uuid,
                     "email": email,
                     "subId": sub_id,
-                    "enable": True,
+                    "enable": self._not_expired(expiry_ms),
                     "expiryTime": expiry_ms,
                     "totalGB": 0,
                     "limitIp": self.device_limit,
@@ -570,7 +579,7 @@ class VPNClient:
             self.last_error = ""
             return await self._create_or_update_locked(user_id, expire_timestamp)
 
-    async def disable_user(self, user_id):
+    async def disable_user(self, user_id, expire_timestamp=None):
         # Реально отключает доступ на стороне 3x-ui (а не только в БД бота) —
         # без этого Happ/v2rayTun продолжали бы работать с ключом после истечения дней.
         self._init_locks()
@@ -583,7 +592,10 @@ class VPNClient:
                 return False
             if not existing:
                 return False
-            payload = self._client_update_body(existing, email=email, enable=False)
+            changes = {"email": email, "enable": False}
+            if expire_timestamp is not None:
+                changes["expiryTime"] = int(expire_timestamp) * 1000
+            payload = self._client_update_body(existing, **changes)
             return await self._api_post(f"/panel/api/clients/update/{email}", payload)
 
     async def delete_client(self, email):
@@ -1768,11 +1780,6 @@ async def profile_callback(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "get_vless_key")
 async def get_vless_key(callback: CallbackQuery):
-    # Сразу снимаем «часики» с кнопки — дальше может быть долгий обмен с панелью.
-    try:
-        await callback.answer()
-    except Exception:
-        pass
     user_id = callback.from_user.id
     user = await asyncio.to_thread(db.get_user, user_id)
     days = calculate_days(user[3])
@@ -1780,6 +1787,11 @@ async def get_vless_key(callback: CallbackQuery):
     if days <= 0:
         await callback.answer("❌ Подписка неактивна. Оплатите дни, чтобы получить ключ для Happ.", show_alert=True)
         return
+    # Сразу снимаем «часики» с кнопки — дальше может быть долгий обмен с панелью.
+    try:
+        await callback.answer()
+    except Exception:
+        pass
 
     vless_key = user[11]
     # Старое/битое значение (например "1") или ссылка не с текущего адреса подписки — выпускаем заново.
@@ -2054,6 +2066,7 @@ async def _sync_panel(user_id: int, expire_dt, reason: str = "payment") -> bool:
         res = await vpn_client.create_or_update_user(user_id, int(expire_dt.timestamp()))
         if res:
             _panel_resync.pop(user_id, None)
+            _invalidate_sub_cache()
             return True
         logging.error(f"Панель 3x-ui не подтвердила продление для {user_id}")
     except Exception as e:
@@ -2565,6 +2578,11 @@ async def admin_disable_finish(message: Message, state: FSMContext):
 
     await asyncio.to_thread(db.disable_subscription, user[0])
     await asyncio.to_thread(db.add_admin_log, message.from_user.id, "Отключил подписку", user[0])
+    try:
+        await vpn_client.disable_user(user[0], expire_timestamp=int(time.time()) - 60)
+    except Exception as e:
+        logging.error(f"Не удалось отключить {user[0]} на панели: {e}")
+    _invalidate_sub_cache()
 
     try:
         await bot.send_message(user[0], "❌ Ваша подписка Stopka VPN была отключена администратором.")
@@ -2670,19 +2688,35 @@ async def give_days(message: Message, state: FSMContext):
         expire = now
 
     expire += timedelta(days=days)
-    expire_str = expire.strftime("%Y-%m-%d 23:59:59")
+    expire_dt = expire.replace(hour=23, minute=59, second=59, microsecond=0)
+    expire_str = expire_dt.strftime("%Y-%m-%d %H:%M:%S")
+    still_active = expire_dt > datetime.now()
+    status = "Активно" if still_active else "Отключено"
 
-    await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status='Активно' WHERE id=?", (expire_str, user[0]))
+    await asyncio.to_thread(db.conn.execute, "UPDATE users SET expire_date=?, status=? WHERE id=?", (expire_str, status, user[0]))
     await asyncio.to_thread(db.conn.commit)
-    await asyncio.to_thread(db.add_admin_log, message.from_user.id, f"Выдал {days} дней", user[0])
+    await asyncio.to_thread(
+        db.add_admin_log, message.from_user.id,
+        f"Выдал {days} дней" if days >= 0 else f"Забрал {-days} дней", user[0]
+    )
 
-    try:
-        await vpn_client.create_or_update_user(user[0], int(expire.replace(hour=23, minute=59, second=59).timestamp()))
-    except:
-        pass
+    # Срок на панели 3x-ui: именно он показывается в Happ. Сбои не глотаем —
+    # _sync_panel поставит срок в очередь и дозапишет его сам.
+    synced = True
+    if still_active:
+        synced = await _sync_panel(user[0], expire_dt, reason="admin")
+    else:
+        try:
+            await vpn_client.disable_user(user[0], expire_timestamp=int(expire_dt.timestamp()))
+        except Exception as e:
+            synced = False
+            logging.error(f"Не удалось отключить {user[0]} на панели: {e}")
+    _invalidate_sub_cache()
 
     await state.clear()
-    await message.answer(f"✅ Выдано {days} дней пользователю {username}", reply_markup=admin_back_keyboard())
+    action = f"✅ Выдано {days} дней" if days >= 0 else f"✅ Забрано {-days} дней"
+    note = "" if synced else "\n⚠️ В боте срок обновлён, а на панели пока нет — бот повторит запись автоматически."
+    await message.answer(f"{action} пользователю {username}{note}", reply_markup=admin_back_keyboard())
 
 @dp.callback_query(F.data == "promo_admin")
 async def promo_admin(callback: CallbackQuery):
@@ -3125,6 +3159,10 @@ HAPP_RU_PROFILE = {
 def _happ_routing_header():
     raw = json.dumps(HAPP_RU_PROFILE, ensure_ascii=False).encode("utf-8")
     return "happ://routing/onadd/" + base64.b64encode(raw).decode()
+
+def _invalidate_sub_cache():
+    """После любого изменения срока на панели — чтобы «обновить» в Happ сразу показало новые дни."""
+    _sub_cache.clear()
 
 _sub_cache = {}   # sub_id -> (monotonic, body, headers): короткий кэш, чтобы Happ не ждал панель на каждом обновлении
 SUB_CACHE_TTL = 60
