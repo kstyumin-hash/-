@@ -430,6 +430,35 @@ class VPNClient:
             walk(data.get("obj"))
         return found
 
+    @staticmethod
+    def _traffic_from(obj):
+        """(up, down) в байтах из записи клиента или ответа панели; None, если полей трафика нет."""
+        if not isinstance(obj, dict):
+            return None
+        for src in (obj, obj.get("traffic"), obj.get("clientTraffic"), obj.get("stats")):
+            if isinstance(src, dict) and ("up" in src or "down" in src):
+                try:
+                    return int(src.get("up") or 0), int(src.get("down") or 0)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    async def get_client_traffic(self, client):
+        """Использованный трафик клиента для строки subscription-userinfo в Happ."""
+        found = self._traffic_from(client)
+        if found:
+            return found
+        email = (client or {}).get("email")
+        if not email:
+            return None
+        try:
+            status, data = await self._request("GET", f"/panel/api/inbounds/getClientTraffics/{email}")
+        except PanelError:
+            return None
+        if status == 200 and isinstance(data, dict) and data.get("success"):
+            return self._traffic_from(data.get("obj"))
+        return None
+
     async def get_client_by_sub_id(self, sub_id):
         """Клиент по subId: GET /panel/api/clients/get/subId/{subId}. None, если не найден."""
         status, data = await self._request("GET", f"/panel/api/clients/get/subId/{sub_id}")
@@ -3226,8 +3255,14 @@ async def handle_subscription(request):
         expiry_ms = int(client.get("expiryTime") or 0)
     except (TypeError, ValueError):
         expiry_ms = 0
+    traffic = await vpn_client.get_client_traffic(client)
+    if traffic is None:
+        logging.warning(f"Подписка {sub_id[:4]}…: трафик клиента не найден, поля записи: {sorted(client.keys())}")
+        traffic = (0, 0)
+    userinfo = f"upload={traffic[0]}; download={traffic[1]}; total=0"
     if expiry_ms > 0:
-        headers["subscription-userinfo"] = f"upload=0; download=0; total=0; expire={expiry_ms // 1000}"
+        userinfo += f"; expire={expiry_ms // 1000}"
+    headers["subscription-userinfo"] = userinfo
     body = base64.b64encode("\n".join(links).encode("utf-8")).decode()
     if len(_sub_cache) > 500:
         _sub_cache.clear()
