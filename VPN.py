@@ -3200,87 +3200,289 @@ def _app_icon(env_name, letter, color_a, color_b):
         return f'<img class="ico" src="{html.escape(url, quote=True)}" alt="">'
     return f'<span class="ico" style="background:linear-gradient(135deg,{color_a},{color_b})">{letter}</span>'
 
+# Магазины и файлы для скачивания. Happ: ссылки с официального сайта happ.su (для iOS — российский
+# App Store, для других регионов — глобальный). INCY: App Store по id приложения, Google Play по
+# имени пакета, файлы для Windows и Linux — из релизов INCY на GitHub.
+SUB_STORES = {
+    "happ": {
+        "android": "https://play.google.com/store/apps/details?id=com.happproxy",
+        "ios": "https://apps.apple.com/ru/app/happ-proxy-utility/id6783623643",
+        "appletv": "https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274",
+    },
+    "incy": {
+        "android": "https://play.google.com/store/apps/details?id=llc.itdev.incy",
+        "ios": "https://apps.apple.com/app/id6756943388",
+    },
+}
+SUB_DOWNLOADS = {
+    "windows": [
+        ("Happ", "Windows x64", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe"),
+        ("Happ", "Windows ARM64", "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.arm64.exe"),
+        ("INCY", "Windows", "https://github.com/INCY-DEV/incy-platforms/releases/download/latest/incy-windows-setup.exe"),
+    ],
+    "linux": [
+        ("DEB", "Debian, Ubuntu", "https://github.com/INCY-DEV/incy-platforms/releases/download/latest/incy-linux-x64.deb"),
+        ("RPM", "Fedora, openSUSE", "https://github.com/INCY-DEV/incy-platforms/releases/download/latest/incy-linux-x64.rpm"),
+        ("ZST", "Arch Linux", "https://github.com/INCY-DEV/incy-platforms/releases/download/latest/incy-linux-x64.pkg.tar.zst"),
+    ],
+}
+
+def _svg(inner, fill=False):
+    mode = 'fill="currentColor" stroke="none"' if fill else 'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"'
+    return f'<svg class="g" viewBox="0 0 24 24" width="18" height="18" {mode} aria-hidden="true">{inner}</svg>'
+
+_TV = '<rect x="3" y="5" width="18" height="12" rx="2.2"/><path d="M8 21h8M12 17v4"/>'
+SUB_ICONS = {
+    "android": _svg('<path d="M5.5 17a6.5 6.5 0 0 1 13 0z" fill="currentColor" stroke="none"/><path d="M8.6 11.2 7.2 8.8M15.4 11.2l1.4-2.4"/><circle cx="9.6" cy="14.4" r="1" fill="rgba(0,0,0,.4)" stroke="none"/><circle cx="14.4" cy="14.4" r="1" fill="rgba(0,0,0,.4)" stroke="none"/>'),
+    "ios": _svg('<rect x="7" y="2.5" width="10" height="19" rx="2.6"/><path d="M10.4 5.7h3.2"/>'),
+    "windows": _svg('<rect x="3" y="3" width="8.2" height="8.2" rx="1.2"/><rect x="12.8" y="3" width="8.2" height="8.2" rx="1.2"/><rect x="3" y="12.8" width="8.2" height="8.2" rx="1.2"/><rect x="12.8" y="12.8" width="8.2" height="8.2" rx="1.2"/>', fill=True),
+    "macos": _svg('<rect x="4.5" y="5" width="15" height="10.5" rx="1.8"/><path d="M2.5 19h19"/>'),
+    "linux": _svg('<rect x="3" y="4" width="18" height="16" rx="2.4"/><path d="M7.5 9.5 10.5 12l-3 2.5M13 15h3.5"/>'),
+    "androidtv": _svg(_TV),
+    "appletv": _svg(_TV + '<circle cx="12" cy="11" r="1.6" fill="currentColor" stroke="none"/>'),
+}
+
+# key, подпись, цвета значка, приложения (приложение, магазин-запасной вариант), особенности
+SUB_PLATFORMS = [
+    ("android", "Android", "#3ddc84", "#0f9d58", [("happ", SUB_STORES["happ"]["android"]), ("incy", SUB_STORES["incy"]["android"])], {"intent": True, "store": "Google Play"}),
+    ("ios", "iOS", "#5ac8fa", "#0a66ff", [("happ", SUB_STORES["happ"]["ios"]), ("incy", SUB_STORES["incy"]["ios"])], {"store": "App Store"}),
+    ("windows", "Windows", "#38bdf8", "#0369a1", [("happ", ""), ("incy", "")], {"downloads": "windows"}),
+    ("macos", "macOS", "#b4bcc9", "#596273", [("happ", SUB_STORES["happ"]["ios"]), ("incy", SUB_STORES["incy"]["ios"])], {"store": "App Store"}),
+    ("linux", "Linux", "#fbbf24", "#d97706", [("incy", "")], {"downloads": "linux"}),
+    ("androidtv", "Android TV", "#34d399", "#0d9488", [("happ", SUB_STORES["happ"]["android"]), ("incy", SUB_STORES["incy"]["android"])], {"intent": True, "store": "Google Play", "tv": True}),
+    ("appletv", "Apple TV", "#9ca3af", "#374151", [("happ", SUB_STORES["happ"]["appletv"]), ("incy", SUB_STORES["incy"]["ios"])], {"store": "App Store", "tv": True}),
+]
+
+def _build_sub_install(sub_url):
+    """Вкладки платформ и содержимое каждой: плитки приложений, запасные ссылки на магазины/файлы."""
+    esc = lambda value: html.escape(str(value), quote=True)
+    meta = {
+        "happ": ("Happ", esc("happ://add/" + sub_url), _app_icon("HAPP_ICON_URL", "H", "#3b82f6", "#1d4ed8")),
+        "incy": ("INCY", esc("incy://import/" + sub_url), _app_icon("INCY_ICON_URL", "I", "#8b5cf6", "#6d28d9")),
+    }
+    chips, panes = [], []
+    for key, label, color_a, color_b, apps, opts in SUB_PLATFORMS:
+        chips.append(
+            f'<button class="chip" type="button" role="tab" data-tab="{key}" style="--a:{color_a};--b:{color_b}">'
+            f'<span class="ci">{SUB_ICONS[key]}</span><span class="cl">{esc(label)}</span></button>'
+        )
+        tiles = []
+        for app, store in apps:
+            name, deep, icon = meta[app]
+            attrs = f'data-app="{app}" href="{deep}"'
+            if opts.get("downloads"):
+                attrs += f' data-dl="dl-{key}"'
+            elif store:
+                attrs += f' data-store="{esc(store)}"'
+            if opts.get("intent"):
+                attrs += ' data-intent="1"'
+            tiles.append(
+                f'<a class="app" {attrs}>{icon}<span class="nm"><b>{name}</b><i>Добавить подписку</i></span>'
+                f'<span class="addbtn">Добавить</span></a>'
+            )
+        extra = ""
+        if opts.get("tv"):
+            extra += '<p class="note">Откройте эту страницу на телефоне или в браузере телевизора. Либо в приложении на ТВ выберите «Добавить подписку» и вставьте ссылку (кнопка внизу).</p>'
+        if opts.get("downloads"):
+            buttons = "".join(
+                f'<a class="dl" href="{esc(url)}" rel="noopener"><span>{esc(title)}</span><small>{esc(sub)}</small></a>'
+                for title, sub, url in SUB_DOWNLOADS[opts["downloads"]]
+            )
+            lead = "Приложение не найдено. Скачайте и установите его, затем нажмите кнопку «Добавить» ещё раз:"
+            extra += (
+                f'<div class="dlbox" id="dl-{key}" hidden><p>{lead}</p><div class="dlgrid">{buttons}</div></div>'
+                f'<button class="toggle" type="button" data-toggle="dl-{key}">Нет приложения? Скачать</button>'
+            )
+        elif opts.get("store"):
+            extra += f'<p class="note">Нет приложения? Откроется {esc(opts["store"])}: установите его и нажмите «Добавить» ещё раз.</p>'
+        panes.append(f'<div class="pane" role="tabpanel" data-pane="{key}">{"".join(tiles)}{extra}</div>')
+    return "".join(chips), "".join(panes)
+
+_MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
 SUB_PAGE_HTML = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark"><meta name="robots" content="noindex">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#0a0f1d" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)">
 <title>Stopka VPN — подписка</title>
+<script>(function(){var t=null;try{t=localStorage.getItem("sub-theme");}catch(e){}if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light";}document.documentElement.setAttribute("data-theme",t);})();</script>
 <style>
-:root{--bg:#f2f4f9;--card:#fff;--fg:#182033;--mute:#6b7690;--line:#e6e9f2;--acc:#2f6bff;--ok:#15a05b;--bad:#e5484d;--tile:#f5f7fc}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1320;--card:#161d2e;--fg:#e9eefb;--mute:#93a0bd;--line:#24304a;--acc:#5b8cff;--ok:#38c98a;--bad:#ff6b70;--tile:#1c2640}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
-.wrap{max-width:460px;margin:0 auto;padding:18px 14px 28px}
-.top{display:flex;align-items:center;gap:12px;margin:6px 4px 16px}
-.logo{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#2f6bff,#8b5cf6);color:#fff;font-weight:800;font-size:20px;display:flex;align-items:center;justify-content:center}
-.top h1{font-size:19px;margin:0}.top p{margin:2px 0 0;font-size:13px;color:var(--mute)}
-.card{background:var(--card);border-radius:20px;padding:16px;margin-bottom:14px;box-shadow:0 6px 22px rgba(15,25,60,.08)}
-.row{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid var(--line);font-size:15px}
-.row:last-of-type{border-bottom:0}.row span:first-child{color:var(--mute)}.row b{font-weight:600;text-align:right}
-.ok{color:var(--ok)}.bad{color:var(--bad)}
-.bar{height:8px;border-radius:99px;background:var(--line);overflow:hidden;margin-top:4px}
-.bar i{display:block;height:100%;background:linear-gradient(90deg,#2f6bff,#8b5cf6);border-radius:99px}
-h2{font-size:16px;margin:0 0 12px}
-.tabs{display:flex;gap:6px;background:var(--tile);padding:4px;border-radius:14px;margin-bottom:12px}
-.tab{flex:1;border:0;background:transparent;color:var(--mute);padding:10px;border-radius:11px;font-size:15px;font-weight:600;cursor:pointer}
-.tab.on{background:var(--card);color:var(--fg);box-shadow:0 2px 8px rgba(15,25,60,.1)}
-.pane{display:none}.pane.on{display:block}
-.tile{display:flex;align-items:center;gap:12px;padding:12px;border-radius:16px;background:var(--tile);color:var(--fg);text-decoration:none;margin-bottom:10px}
-.tile:active{opacity:.8}
-.ico{width:46px;height:46px;border-radius:13px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:22px;flex:none;object-fit:cover}
-.nm{flex:1;display:flex;flex-direction:column;min-width:0}.nm b{font-size:16px}.nm i{font-style:normal;font-size:13px;color:var(--mute)}
-.go{font-size:26px;color:var(--mute)}
-.dl{font-size:13px;color:var(--mute);margin:2px 2px 4px}.dl a{color:var(--acc);text-decoration:none}
-.btn{display:block;width:100%;border:0;border-radius:14px;padding:14px;font-size:15px;font-weight:600;text-align:center;text-decoration:none;cursor:pointer;margin-top:8px}
-.b1{background:var(--tile);color:var(--fg)}.b2{background:var(--acc);color:#fff}
-.hint{font-size:12.5px;color:var(--mute);line-height:1.45;margin:10px 2px 0}
-.warn{background:rgba(229,72,77,.12);color:var(--bad);border-radius:14px;padding:12px;font-size:14px;margin-bottom:12px;line-height:1.4}
-.foot{text-align:center;font-size:13px;color:var(--mute);margin-top:6px}.foot a{color:var(--acc);text-decoration:none}
+:root{color-scheme:light;--bg:#f3f5fb;--card:rgba(255,255,255,.84);--solid:#fff;--fg:#0f172a;--mute:#64748b;--line:rgba(15,23,42,.08);--acc:#4f46e5;--acc2:#2563eb;--ok:#15803d;--okbg:rgba(22,163,74,.13);--bad:#b91c1c;--badbg:rgba(220,38,38,.12);--chip:#f0f3fb;--shadow:0 12px 32px rgba(40,55,110,.12);--glow1:rgba(99,102,241,.24);--glow2:rgba(34,211,238,.20)}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#090e1b;--card:rgba(21,29,52,.80);--solid:#141c34;--fg:#e8edff;--mute:#96a3bd;--line:rgba(148,163,184,.16);--acc:#818cf8;--acc2:#60a5fa;--ok:#4ade80;--okbg:rgba(74,222,128,.15);--bad:#fca5a5;--badbg:rgba(248,113,113,.16);--chip:#19223f;--shadow:0 12px 32px rgba(0,0,0,.45);--glow1:rgba(99,102,241,.32);--glow2:rgba(34,211,238,.15)}
+@media (prefers-color-scheme:dark){:root:not([data-theme]){color-scheme:dark;--bg:#090e1b;--card:rgba(21,29,52,.80);--solid:#141c34;--fg:#e8edff;--mute:#96a3bd;--line:rgba(148,163,184,.16);--acc:#818cf8;--acc2:#60a5fa;--ok:#4ade80;--okbg:rgba(74,222,128,.15);--bad:#fca5a5;--badbg:rgba(248,113,113,.16);--chip:#19223f;--shadow:0 12px 32px rgba(0,0,0,.45);--glow1:rgba(99,102,241,.32);--glow2:rgba(34,211,238,.15)}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{background:var(--bg)}
+body{margin:0;min-height:100vh;color:var(--fg);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-text-size-adjust:100%;background:radial-gradient(900px 420px at 12% -8%,var(--glow1),transparent 62%),radial-gradient(800px 440px at 108% 2%,var(--glow2),transparent 58%) fixed;transition:background-color .3s}
+.wrap{max-width:480px;margin:0 auto;padding:max(16px,env(safe-area-inset-top)) 14px max(26px,env(safe-area-inset-bottom))}
+.top{display:flex;align-items:center;justify-content:space-between;margin:2px 2px 16px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,#6366f1,#2563eb 55%,#06b6d4);color:#fff;font-weight:800;font-size:21px;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 20px rgba(79,70,229,.35)}
+.brand h1{font-size:19px;margin:0;letter-spacing:-.01em}.brand p{margin:1px 0 0;font-size:12.5px;color:var(--mute)}
+.icobtn{width:42px;height:42px;border-radius:14px;border:1px solid var(--line);background:var(--card);color:var(--fg);display:flex;align-items:center;justify-content:center;cursor:pointer;-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);box-shadow:var(--shadow);transition:transform .15s}
+.icobtn:active{transform:scale(.92)}.icobtn svg{width:20px;height:20px}
+:root[data-theme="dark"] .i-moon{display:none}:root:not([data-theme="dark"]) .i-sun{display:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:24px;padding:18px;margin-bottom:14px;box-shadow:var(--shadow);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);animation:rise .5s ease both}
+.card+.card{animation-delay:.08s}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.herotop{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:99px;font-size:13px;font-weight:700}
+.pill i{width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 0 4px rgba(128,128,128,.18)}
+.pill.ok{color:var(--ok);background:var(--okbg)}.pill.bad{color:var(--bad);background:var(--badbg)}
+.uid{font-size:12.5px;color:var(--mute);background:var(--chip);border:1px solid var(--line);padding:6px 10px;border-radius:10px;font-variant-numeric:tabular-nums}
+.until{margin:16px 0 14px}.until small{display:block;font-size:12.5px;color:var(--mute);margin-bottom:3px}
+.until strong{display:block;font-size:24px;letter-spacing:-.02em;line-height:1.15}
+.until em{font-style:normal;font-size:13.5px;color:var(--mute)}
+.tr{background:var(--chip);border:1px solid var(--line);border-radius:16px;padding:12px 14px}
+.trh{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--mute);margin-bottom:9px}
+.trh b{font-size:15px;color:var(--fg);font-weight:700}.trh u{text-decoration:none;color:var(--mute);font-weight:500;margin:0 3px}
+.bar{height:8px;border-radius:99px;background:var(--line);overflow:hidden}
+.bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#6366f1,#22d3ee)}
+.bar.inf i{width:100%;background:linear-gradient(90deg,#6366f1,#22d3ee,#6366f1);background-size:200% 100%;animation:flow 3.2s linear infinite}
+@keyframes flow{to{background-position:-200% 0}}
+h2{font-size:17px;margin:0 0 3px;letter-spacing:-.01em}.lead{margin:0 0 14px;color:var(--mute);font-size:13.5px}
+.warn{background:var(--badbg);color:var(--bad);border-radius:14px;padding:12px 14px;font-size:14px;margin-bottom:14px;line-height:1.4}
+.chips{display:flex;gap:5px;overflow-x:auto;padding:6px 8px 16px;margin:-4px -8px 0;scroll-snap-type:x proximity;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.chips.fade{-webkit-mask-image:linear-gradient(90deg,#000 88%,transparent);mask-image:linear-gradient(90deg,#000 88%,transparent)}
+.chips::-webkit-scrollbar{display:none}
+.chip{flex:1 0 52px;max-width:78px;scroll-snap-align:center;display:flex;flex-direction:column;align-items:center;gap:6px;padding:9px 3px 8px;border-radius:16px;border:1px solid var(--line);background:var(--chip);color:var(--mute);font-weight:600;font-size:11px;line-height:1.15;font-family:inherit;cursor:pointer;transition:transform .15s,box-shadow .2s,background .2s,color .2s}
+.chip .ci{width:30px;height:30px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;background:linear-gradient(135deg,var(--a),var(--b));opacity:.62;transition:opacity .2s,transform .2s}
+.chip .cl{text-align:center;min-height:2.3em;display:flex;align-items:center}
+.chip:active{transform:scale(.95)}
+.chip.on{background:var(--solid);color:var(--fg);border-color:transparent;box-shadow:0 8px 20px rgba(15,25,60,.16),0 0 0 2px var(--a)}
+.chip.on .ci{opacity:1;transform:scale(1.06)}
+.pane{display:none}.pane.on{display:block;animation:fade .28s ease}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.app{display:flex;align-items:center;gap:13px;padding:12px;border-radius:20px;background:var(--chip);border:1px solid var(--line);text-decoration:none;color:var(--fg);margin-bottom:10px;transition:transform .15s,box-shadow .2s}
+.app:hover{box-shadow:var(--shadow)}.app:active{transform:scale(.985)}
+.ico{width:52px;height:52px;border-radius:15px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:25px;flex:none;object-fit:cover;box-shadow:0 6px 16px rgba(30,40,100,.25)}
+.nm{display:flex;flex-direction:column;min-width:0}.nm b{font-size:17px;letter-spacing:-.01em}.nm i{font-style:normal;font-size:12.5px;color:var(--mute)}
+.addbtn{margin-left:auto;flex:none;background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;border-radius:13px;padding:10px 15px;font-size:13.5px;font-weight:700;box-shadow:0 6px 16px rgba(79,70,229,.32)}
+:root[data-theme="dark"] .addbtn{color:#0b1226}
+.note{margin:2px 2px 4px;font-size:12.5px;color:var(--mute);line-height:1.45}
+.toggle{display:block;background:none;border:0;color:var(--acc);font-weight:600;font-size:13px;font-family:inherit;padding:6px 2px 2px;cursor:pointer}
+.dlbox{margin:2px 0 8px;padding:14px;border-radius:18px;border:1px dashed var(--acc);background:var(--chip);animation:fade .3s ease}
+.dlbox[hidden]{display:none}.dlbox p{margin:0 0 11px;font-size:13.5px;line-height:1.4}
+.dlgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+.dl{display:flex;flex-direction:column;align-items:center;gap:2px;padding:12px 8px;border-radius:14px;background:var(--solid);border:1px solid var(--line);color:var(--fg);text-decoration:none;font-weight:800;font-size:15px;transition:transform .15s}
+.dl small{font-weight:500;color:var(--mute);font-size:11.5px;text-align:center}.dl:active{transform:scale(.97)}
+.copy{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;margin-top:12px;border:1px solid var(--line);background:var(--chip);color:var(--fg);border-radius:15px;padding:13px;font-weight:600;font-size:14.5px;font-family:inherit;cursor:pointer;transition:transform .15s}
+.copy:active{transform:scale(.98)}.copy svg{width:17px;height:17px}
+.hint{font-size:12.5px;color:var(--mute);line-height:1.5;margin:12px 2px 0}
+.support{display:flex;align-items:center;justify-content:center;gap:9px;padding:14px;border-radius:18px;background:var(--card);border:1px solid var(--line);color:var(--fg);text-decoration:none;font-weight:600;box-shadow:var(--shadow);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
+.support svg{width:19px;height:19px;color:var(--acc)}
+.fine{text-align:center;font-size:12px;color:var(--mute);margin:12px 0 0}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body><div class="wrap">
-<div class="top"><div class="logo">S</div><div><h1>Stopka VPN</h1><p>Страница подписки</p></div></div>
 
-<div class="card">
-<div class="row"><span>ID пользователя</span><b>__USER__</b></div>
-<div class="row"><span>Статус</span><b class="__STATUS_CLASS__">__STATUS__</b></div>
-<div class="row"><span>Подписка истекает</span><b>__EXPIRY__</b></div>
-<div class="row"><span>Использовано трафика</span><b>__USED__ из __TOTAL__</b></div>
-__BAR__
-</div>
+<header class="top">
+<div class="brand"><div class="logo">S</div><div><h1>Stopka VPN</h1><p>Ваша подписка</p></div></div>
+<button class="icobtn" id="theme" type="button" aria-label="Сменить тему">
+<svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+<svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+</button>
+</header>
 
-<div class="card">
+<section class="card">
+<div class="herotop"><span class="pill __STATUS_CLASS__"><i></i>__STATUS__</span><span class="uid">ID __USER__</span></div>
+<div class="until"><small>__UNTIL_LABEL__</small><strong>__EXPIRY_DATE__</strong><em>__EXPIRY_LEFT__</em></div>
+<div class="tr"><div class="trh"><span>Использовано трафика</span><b>__USED__ <u>из</u> __TOTAL__</b></div>__BAR__</div>
+</section>
+
+<section class="card">
 __WARN__
-<h2>Добавить подписку</h2>
-<div class="tabs"><button class="tab" data-tab="android" type="button">Android</button><button class="tab" data-tab="ios" type="button">iOS</button></div>
-<div class="pane" data-pane="android">
-<a class="tile" href="__HAPP__">__HAPP_ICON__<span class="nm"><b>Happ</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
-<a class="tile" href="__INCY__">__INCY_ICON__<span class="nm"><b>INCY</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
-<div class="dl">Нет приложения? Скачать: <a href="__HAPP_ANDROID__">Happ</a> · <a href="__INCY_SITE__">INCY</a></div>
-</div>
-<div class="pane" data-pane="ios">
-<a class="tile" href="__HAPP__">__HAPP_ICON__<span class="nm"><b>Happ</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
-<a class="tile" href="__INCY__">__INCY_ICON__<span class="nm"><b>INCY</b><i>Нажмите, чтобы добавить подписку</i></span><span class="go">›</span></a>
-<div class="dl">Нет приложения? Скачать: <a href="__HAPP_IOS__">Happ</a> · <a href="__INCY_SITE__">INCY</a></div>
-</div>
-<button class="btn b1" id="copy" type="button">Скопировать ссылку подписки</button>
-<p class="hint">Если приложение не открылось, откройте эту страницу в обычном браузере (в Telegram: ⋮ → «Открыть в браузере») или скопируйте ссылку и вставьте её в приложение: «Добавить подписку» → «Из буфера».</p>
-</div>
+<h2>Установка</h2><p class="lead">Выберите устройство и приложение</p>
+<div class="chips" role="tablist">__CHIPS__</div>
+__PANES__
+<button class="copy" id="copy" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15V6.5A2.5 2.5 0 0 1 7.5 4H15"/></svg><span>Скопировать ссылку подписки</span></button>
+<p class="hint">Если приложение не открылось, откройте эту страницу в обычном браузере (в Telegram: ⋮ → «Открыть в браузере») или вставьте скопированную ссылку в приложение: «Добавить подписку» → «Из буфера».</p>
+</section>
 
-<div class="foot">Вопросы и продление — <a href="__SUPPORT__">Telegram-бот</a></div>
+<a class="support" href="__SUPPORT__"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>Поддержка и продление в Telegram</a>
+<p class="fine">Stopka VPN</p>
 </div>
 <script>
 (function(){
   var subUrl=__SUBURL__;
   var ua=navigator.userAgent||"";
-  var ios=/iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1);
-  var tabs=document.querySelectorAll(".tab"),panes=document.querySelectorAll(".pane");
+  var android=/Android/i.test(ua);
+  var root=document.documentElement;
+
+  document.getElementById("theme").onclick=function(){
+    var next=root.getAttribute("data-theme")==="dark"?"light":"dark";
+    root.setAttribute("data-theme",next);
+    try{localStorage.setItem("sub-theme",next);}catch(e){}
+  };
+
+  var chips=document.querySelectorAll(".chip"),panes=document.querySelectorAll(".pane");
   function show(name){
-    for(var i=0;i<tabs.length;i++){tabs[i].className="tab"+(tabs[i].getAttribute("data-tab")===name?" on":"");}
+    for(var i=0;i<chips.length;i++){
+      var on=chips[i].getAttribute("data-tab")===name;
+      chips[i].className="chip"+(on?" on":"");
+      chips[i].setAttribute("aria-selected",on?"true":"false");
+      if(on){try{chips[i].scrollIntoView({inline:"center",block:"nearest",behavior:"smooth"});}catch(e){}}
+    }
     for(var j=0;j<panes.length;j++){panes[j].className="pane"+(panes[j].getAttribute("data-pane")===name?" on":"");}
   }
-  for(var k=0;k<tabs.length;k++){tabs[k].onclick=function(){show(this.getAttribute("data-tab"));};}
-  show(ios?"ios":"android");
-  var copy=document.getElementById("copy");
+  for(var k=0;k<chips.length;k++){chips[k].onclick=function(){show(this.getAttribute("data-tab"));};}
+  function detect(){
+    if(/Android/i.test(ua)){return /(\bTV\b|AFT[A-Z]|BRAVIA|MIBOX|SHIELD|CrKey)/i.test(ua)?"androidtv":"android";}
+    if(/iPhone|iPad|iPod/i.test(ua)){return "ios";}
+    if(/Macintosh/i.test(ua)){return navigator.maxTouchPoints>1?"ios":"macos";}
+    if(/Windows/i.test(ua)){return "windows";}
+    if(/Linux|X11|CrOS/i.test(ua)){return "linux";}
+    return "android";
+  }
+  show(detect());
+  var strip=document.querySelector(".chips");
+  function fadeCheck(){strip.className="chips"+((strip.scrollWidth-strip.clientWidth-strip.scrollLeft>6)?" fade":"");}
+  strip.addEventListener("scroll",fadeCheck);window.addEventListener("resize",fadeCheck);fadeCheck();
+
+  function reveal(id){
+    var el=document.getElementById(id);
+    if(!el){return;}
+    el.hidden=false;
+    try{el.scrollIntoView({behavior:"smooth",block:"center"});}catch(e){}
+  }
+  var toggles=document.querySelectorAll("[data-toggle]");
+  for(var m=0;m<toggles.length;m++){
+    toggles[m].onclick=function(){var el=document.getElementById(this.getAttribute("data-toggle"));if(el){el.hidden=!el.hidden;}};
+  }
+
+  var schemes={happ:"happ://add/",incy:"incy://import/"};
+  function openApp(tile){
+    var app=tile.getAttribute("data-app"),store=tile.getAttribute("data-store"),dl=tile.getAttribute("data-dl");
+    var useIntent=tile.getAttribute("data-intent")==="1"&&android&&store;
+    var deep=schemes[app]+subUrl,left=false;
+    function hid(){if(document.hidden){left=true;}}
+    document.addEventListener("visibilitychange",hid);
+    window.addEventListener("pagehide",function(){left=true;});
+    if(dl){window.addEventListener("blur",function(){left=true;});}
+    var target=deep;
+    if(useIntent){
+      // Android: если приложения нет, браузер сам откроет Google Play
+      target="intent://"+deep.slice(deep.indexOf("://")+3)+"#Intent;scheme="+app+";S.browser_fallback_url="+encodeURIComponent(store)+";end";
+    }
+    window.location.href=target;
+    setTimeout(function(){
+      document.removeEventListener("visibilitychange",hid);
+      if(left||document.hidden){return;}
+      if(dl){reveal(dl);}else if(store){window.location.href=store;}
+    },2000);
+  }
+  var tiles=document.querySelectorAll(".app");
+  for(var t=0;t<tiles.length;t++){
+    tiles[t].onclick=function(e){
+      if(e&&e.preventDefault){e.preventDefault();}
+      openApp(this);
+      return false;
+    };
+  }
+
+  var copy=document.getElementById("copy"),label=copy.querySelector("span");
   copy.onclick=function(){
-    function ok(){copy.textContent="Ссылка скопирована ✓";}
+    function ok(){label.textContent="Ссылка скопирована ✓";}
     if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(subUrl).then(ok,function(){prompt("Скопируйте ссылку:",subUrl);});}
     else{prompt("Скопируйте ссылку:",subUrl);}
   };
@@ -3309,41 +3511,49 @@ def render_sub_page(sub_id, client, traffic):
     active = bool(client.get("enable", True)) and (expiry_ms <= 0 or expiry_ms / 1000 > now)
     if expiry_ms > 0:
         left = expiry_ms / 1000 - now
-        stamp = datetime.fromtimestamp(expiry_ms / 1000, _page_tz()).strftime("%d.%m.%Y, %H:%M")
+        moment = datetime.fromtimestamp(expiry_ms / 1000, _page_tz())
+        expiry_date = f"{moment.day} {_MONTHS_RU[moment.month - 1]} {moment.year}, {moment:%H:%M}"
         if left <= 0:
-            expiry_text = f"{stamp} (срок истёк)"
+            expiry_left = "срок подписки истёк"
         elif left < 86400:
-            expiry_text = f"{stamp} (меньше суток)"
+            expiry_left = "осталось меньше суток"
         else:
             days = int(left // 86400)
-            expiry_text = f"{stamp} ({days} {_days_word(days)})"
+            expiry_left = f"осталось {days} {_days_word(days)}"
     else:
-        expiry_text = "Бессрочно"
+        expiry_date, expiry_left = "Бессрочно", ""
+    if expiry_ms <= 0:
+        until_label = "Срок подписки"
+    elif expiry_ms / 1000 <= now:
+        until_label = "Подписка действовала до"
+    else:
+        until_label = "Подписка действует до"
 
-    bar = ""
     if total > 0:
         percent = min(100, int(used * 100 / total))
         bar = f'<div class="bar"><i style="width:{percent}%"></i></div>'
+        total_text = esc(_fmt_bytes(total))
+    else:
+        bar = '<div class="bar inf"><i></i></div>'
+        total_text = "∞"
 
     warn = "" if active else '<div class="warn">Подписка не активна. Продлите её в Telegram-боте, чтобы VPN снова заработал.</div>'
     support = os.environ.get("SUB_SUPPORT_URL", "https://t.me/StopkaVPN_bot").strip() or "https://t.me/StopkaVPN_bot"
+    chips, panes = _build_sub_install(sub_url)
 
     replacements = {
         "__USER__": esc(user_label),
         "__STATUS_CLASS__": "ok" if active else "bad",
         "__STATUS__": "Активна" if active else "Не активна",
-        "__EXPIRY__": esc(expiry_text),
+        "__UNTIL_LABEL__": until_label,
+        "__EXPIRY_DATE__": esc(expiry_date),
+        "__EXPIRY_LEFT__": esc(expiry_left),
         "__USED__": esc(_fmt_bytes(used)),
-        "__TOTAL__": esc(_fmt_bytes(total)) if total > 0 else "∞",
+        "__TOTAL__": total_text,
         "__BAR__": bar,
         "__WARN__": warn,
-        "__HAPP__": esc("happ://add/" + sub_url),
-        "__INCY__": esc("incy://import/" + sub_url),
-        "__HAPP_ICON__": _app_icon("HAPP_ICON_URL", "H", "#3b82f6", "#1d4ed8"),
-        "__INCY_ICON__": _app_icon("INCY_ICON_URL", "I", "#8b5cf6", "#6d28d9"),
-        "__HAPP_IOS__": "https://apps.apple.com/app/happ-proxy-utility/id6504287215",
-        "__HAPP_ANDROID__": "https://play.google.com/store/search?q=Happ%20Proxy%20Utility&amp;c=apps",
-        "__INCY_SITE__": "https://incy.cc",
+        "__CHIPS__": chips,
+        "__PANES__": panes,
         "__SUPPORT__": esc(support),
         "__SUBURL__": json.dumps(sub_url),
     }
