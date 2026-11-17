@@ -3308,6 +3308,7 @@ SUB_PAGE_HTML = r"""<!doctype html>
 <meta name="theme-color" content="#f4f6fb" media="(prefers-color-scheme: light)">
 <title>Stopka VPN — подписка</title>
 <script>(function(){var t=null;try{t=localStorage.getItem("sub-theme");}catch(e){}if(t!=="light"&&t!=="dark"){t=(window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light";}document.documentElement.setAttribute("data-theme",t);})();</script>
+<script>(function(){var ua=navigator.userAgent||"";var tv=/(\bTV\b|AFT[A-Z]|BRAVIA|SMART-?TV|SmartTV|Tizen|Web0S|WebOS|CrKey|MIBOX|SHIELD|HbbTV|NetCast|GoogleTV|Fire TV)/i.test(ua)||/[?&]view=tv(&|$)/.test(location.search);document.documentElement.setAttribute("data-device",tv?"tv":"auto");})();</script>
 <style>
 :root{color-scheme:light;--bg:#f3f5fb;--card:rgba(255,255,255,.84);--solid:#fff;--fg:#0f172a;--mute:#64748b;--line:rgba(15,23,42,.08);--acc:#4f46e5;--acc2:#2563eb;--ok:#15803d;--okbg:rgba(22,163,74,.13);--bad:#b91c1c;--badbg:rgba(220,38,38,.12);--chip:#f0f3fb;--shadow:0 12px 32px rgba(40,55,110,.12);--glow1:rgba(99,102,241,.24);--glow2:rgba(34,211,238,.20)}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#090e1b;--card:rgba(21,29,52,.80);--solid:#141c34;--fg:#e8edff;--mute:#96a3bd;--line:rgba(148,163,184,.16);--acc:#818cf8;--acc2:#60a5fa;--ok:#4ade80;--okbg:rgba(74,222,128,.15);--bad:#fca5a5;--badbg:rgba(248,113,113,.16);--chip:#19223f;--shadow:0 12px 32px rgba(0,0,0,.45);--glow1:rgba(99,102,241,.32);--glow2:rgba(34,211,238,.15)}
@@ -3336,7 +3337,7 @@ body{margin:0;min-height:100vh;color:var(--fg);font:15px/1.45 -apple-system,Blin
 .until em{font-style:normal;font-size:13.5px;color:var(--mute)}
 .tr{background:var(--chip);border:1px solid var(--line);border-radius:16px;padding:12px 14px}
 .trh{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;color:var(--mute);margin-bottom:9px}
-.trh b{font-size:15px;color:var(--fg);font-weight:700}.trh u{text-decoration:none;color:var(--mute);font-weight:500;margin:0 3px}
+.trh b{font-size:15px;color:var(--fg);font-weight:700;white-space:nowrap}.trh u{text-decoration:none;color:var(--mute);font-weight:500;margin:0 3px}
 .bar{height:8px;border-radius:99px;background:var(--line);overflow:hidden}
 .bar i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,#6366f1,#22d3ee)}
 .bar.inf i{width:100%;background:linear-gradient(90deg,#6366f1,#22d3ee,#6366f1);background-size:200% 100%;animation:flow 3.2s linear infinite}
@@ -3373,6 +3374,48 @@ h2{font-size:17px;margin:0 0 3px;letter-spacing:-.01em}.lead{margin:0 0 14px;col
 .support{display:flex;align-items:center;justify-content:center;gap:9px;padding:14px;border-radius:18px;background:var(--card);border:1px solid var(--line);color:var(--fg);text-decoration:none;font-weight:600;box-shadow:var(--shadow);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
 .support svg{width:19px;height:19px;color:var(--acc)}
 .fine{text-align:center;font-size:12px;color:var(--mute);margin:12px 0 0}
+a:focus-visible,button:focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+.app:focus-visible,.chip:focus-visible,.dl:focus-visible{outline-offset:2px}
+@media (hover:hover){.chip:hover{transform:translateY(-2px)}.app:hover{transform:translateY(-2px)}.dl:hover{transform:translateY(-2px)}}
+
+/* ПК: две колонки, плитки приложений рядом */
+@media (min-width:880px){
+html:not([data-device="tv"]) .wrap{max-width:1080px;padding:38px 32px 52px}html:not([data-device="tv"]) .top{margin:0 0 26px}html:not([data-device="tv"]) .logo{width:50px;height:50px;font-size:24px;border-radius:16px}html:not([data-device="tv"]) .brand h1{font-size:22px}html:not([data-device="tv"]) .brand p{font-size:13.5px}html:not([data-device="tv"]) .layout{display:grid;grid-template-columns:minmax(320px,5fr) minmax(0,7fr);grid-template-areas:"hero install" "support install" "fine fine";grid-template-rows:auto 1fr auto;gap:20px 24px;align-items:start}html:not([data-device="tv"]) .hero{grid-area:hero;margin:0}html:not([data-device="tv"]) .install{grid-area:install;margin:0;padding:26px}html:not([data-device="tv"]) .support{grid-area:support}html:not([data-device="tv"]) .fine{grid-area:fine}html:not([data-device="tv"]) .until strong{font-size:28px}html:not([data-device="tv"]) .chips{overflow:visible;padding:4px 2px 18px;margin:0;gap:8px}html:not([data-device="tv"]) .chip{flex:1 1 0;max-width:none;padding:13px 4px 11px;font-size:12.5px;border-radius:18px}html:not([data-device="tv"]) .chip .ci{width:38px;height:38px;border-radius:13px}html:not([data-device="tv"]) .pane.on{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;align-content:start}html:not([data-device="tv"]) .pane .app{flex-direction:column;align-items:flex-start;gap:14px;padding:20px;margin:0;border-radius:22px}html:not([data-device="tv"]) .pane .app .ico{width:58px;height:58px;font-size:28px}html:not([data-device="tv"]) .pane .addbtn{margin:4px 0 0;width:100%;text-align:center;padding:12px 15px}html:not([data-device="tv"]) .pane .note,html:not([data-device="tv"]) .pane .dlbox,html:not([data-device="tv"]) .pane .toggle{grid-column:1/-1}html:not([data-device="tv"]) .pane .toggle{justify-self:start}
+}
+
+/* Телевизор (Android TV и др.): крупно, управление пультом, всё на одном экране */
+html[data-device="tv"]{font-size:2.4vh}
+html[data-device="tv"] body{font-size:1rem;line-height:1.4}
+html[data-device="tv"] .wrap{max-width:none;width:100%;padding:2vh 3.2vw}
+html[data-device="tv"] .top{margin:0 0 1rem}
+html[data-device="tv"] .logo{width:3.2rem;height:3.2rem;border-radius:1rem;font-size:1.6rem}
+html[data-device="tv"] .brand h1{font-size:1.6rem}html[data-device="tv"] .brand p{font-size:.85rem}
+html[data-device="tv"] .icobtn{width:3rem;height:3rem;border-radius:1rem}html[data-device="tv"] .icobtn svg{width:1.4rem;height:1.4rem}
+html[data-device="tv"] .layout{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);grid-template-areas:"hero install" "support install";grid-template-rows:auto 1fr;gap:1.2rem 1.6rem;align-items:start}
+html[data-device="tv"] .hero{grid-area:hero;margin:0}html[data-device="tv"] .install{grid-area:install;margin:0}
+html[data-device="tv"] .support{grid-area:support}html[data-device="tv"] .fine{display:none}
+html[data-device="tv"] .card{padding:1.3rem;border-radius:1.5rem}
+html[data-device="tv"] .pill{font-size:.9rem;padding:.4rem .9rem}html[data-device="tv"] .uid{font-size:.85rem;padding:.4rem .7rem;border-radius:.7rem}
+html[data-device="tv"] .until{margin:1.1rem 0 1rem}
+html[data-device="tv"] .until small,html[data-device="tv"] .until em{font-size:.9rem}html[data-device="tv"] .until strong{font-size:1.7rem}
+html[data-device="tv"] .tr{padding:.9rem 1rem;border-radius:1.1rem}html[data-device="tv"] .trh{font-size:.9rem;margin-bottom:.6rem}
+html[data-device="tv"] .trh b{font-size:1.05rem}html[data-device="tv"] .bar{height:.6rem}
+html[data-device="tv"] h2{font-size:1.4rem}html[data-device="tv"] .lead{font-size:.95rem;margin-bottom:.6rem}
+html[data-device="tv"] .warn{font-size:.95rem}
+html[data-device="tv"] .chips{display:grid;grid-template-columns:repeat(7,1fr);gap:.5rem;overflow:visible;padding:.4rem .3rem .8rem;margin:0;-webkit-mask-image:none;mask-image:none}
+html[data-device="tv"] .chip{width:auto;max-width:none;padding:.7rem .2rem;font-size:.78rem;border-radius:1.1rem}
+html[data-device="tv"] .chip .ci{width:2.3rem;height:2.3rem;border-radius:.8rem}html[data-device="tv"] .chip .ci svg{width:1.3rem;height:1.3rem}
+html[data-device="tv"] .pane.on{display:block}
+html[data-device="tv"] .app{padding:.9rem 1rem;border-radius:1.4rem;gap:1rem;margin-bottom:.8rem}
+html[data-device="tv"] .ico{width:3.6rem;height:3.6rem;border-radius:1.1rem;font-size:1.8rem}
+html[data-device="tv"] .nm b{font-size:1.3rem}html[data-device="tv"] .nm i{font-size:.85rem}
+html[data-device="tv"] .addbtn{font-size:1rem;padding:.7rem 1.2rem;border-radius:1rem}
+html[data-device="tv"] .note{font-size:.85rem}html[data-device="tv"] .toggle{font-size:.95rem}
+html[data-device="tv"] .dlbox p{font-size:.95rem}html[data-device="tv"] .dl{font-size:1.05rem;padding:.8rem}html[data-device="tv"] .dl small{font-size:.8rem}
+html[data-device="tv"] .copy{font-size:1rem;padding:.85rem;border-radius:1.1rem}html[data-device="tv"] .copy svg{width:1.2rem;height:1.2rem}
+html[data-device="tv"] .hint{display:none}
+html[data-device="tv"] .support{font-size:1rem;padding:1rem;border-radius:1.2rem}html[data-device="tv"] .support svg{width:1.3rem;height:1.3rem}
+html[data-device="tv"] a:focus-visible,html[data-device="tv"] button:focus-visible{outline:.2rem solid var(--fg);outline-offset:.2rem;transform:scale(1.03);box-shadow:0 0 0 .4rem var(--acc),var(--shadow)}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body><div class="wrap">
 
@@ -3384,13 +3427,14 @@ h2{font-size:17px;margin:0 0 3px;letter-spacing:-.01em}.lead{margin:0 0 14px;col
 </button>
 </header>
 
-<section class="card">
+<main class="layout">
+<section class="card hero">
 <div class="herotop"><span class="pill __STATUS_CLASS__"><i></i>__STATUS__</span><span class="uid">ID __USER__</span></div>
 <div class="until"><small>__UNTIL_LABEL__</small><strong>__EXPIRY_DATE__</strong><em>__EXPIRY_LEFT__</em></div>
 <div class="tr"><div class="trh"><span>Использовано трафика</span><b>__USED__ <u>из</u> __TOTAL__</b></div>__BAR__</div>
 </section>
 
-<section class="card">
+<section class="card install">
 __WARN__
 <h2>Установка</h2><p class="lead">Выберите устройство и приложение</p>
 <div class="chips" role="tablist">__CHIPS__</div>
@@ -3401,6 +3445,7 @@ __PANES__
 
 <a class="support" href="__SUPPORT__"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/></svg>Поддержка и продление в Telegram</a>
 <p class="fine">Stopka VPN</p>
+</main>
 </div>
 <script>
 (function(){
@@ -3435,6 +3480,15 @@ __PANES__
     return "android";
   }
   show(detect());
+  var tvMode=root.getAttribute("data-device")==="tv";
+  function chipKeys(e){
+    var key=e.key||"";
+    if(key!=="ArrowLeft"&&key!=="ArrowRight"){return;}
+    var list=Array.prototype.slice.call(chips),at=list.indexOf(this),next=list[at+(key==="ArrowRight"?1:-1)];
+    if(next){e.preventDefault();next.focus();show(next.getAttribute("data-tab"));}
+  }
+  for(var q=0;q<chips.length;q++){chips[q].onkeydown=chipKeys;}
+  if(tvMode){var first=document.querySelector(".pane.on .app");if(first){try{first.focus({preventScroll:true});}catch(e){first.focus();}}}
   var strip=document.querySelector(".chips");
   function fadeCheck(){strip.className="chips"+((strip.scrollWidth-strip.clientWidth-strip.scrollLeft>6)?" fade":"");}
   strip.addEventListener("scroll",fadeCheck);window.addEventListener("resize",fadeCheck);fadeCheck();
