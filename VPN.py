@@ -19,7 +19,7 @@ import traceback
 import hmac
 import re
 import base64
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, urlparse
 from collections import defaultdict
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -1036,9 +1036,6 @@ class Database:
         # пользователя, реферал тут вообще ни при чём.
         self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS vless_key TEXT DEFAULT ''")
         self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_key_reset TEXT DEFAULT ''")
-        # Последние настоящие ссылки подключения клиента (JSON-список): нужны, чтобы при неактивной
-        # подписке отдавать привычную локацию, а не заглушки панели.
-        self.conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sub_links TEXT DEFAULT ''")
         
         # Флаг «принял условия использования / политику конфиденциальности» —
         # чтобы приветственный экран показывался пользователю ровно один раз.
@@ -2925,17 +2922,6 @@ async def subscription_checker():
                 if expire < now and status == "Активно":
                     await asyncio.to_thread(db.disable_subscription, user_id)
                     try:
-                        # Пока клиент ещё включён, запоминаем его настоящие ссылки: после
-                        # отключения панель отдаёт вместо них заглушки.
-                        _email = f"user_{user_id}"
-                        _ex = await vpn_client._find_existing_client(_email)
-                        if _ex and _ex.get("subId"):
-                            _real = [l for l in await vpn_client.fetch_client_links(_email, _ex["subId"])
-                                     if not _is_placeholder_link(l)]
-                            await remember_real_links(_email, _real)
-                    except Exception as e:
-                        logging.warning(f"Не удалось запомнить ссылки {user_id} перед отключением: {e}")
-                    try:
                         # Отключаем сам ключ на панели 3x-ui, иначе Happ/v2rayTun
                         # продолжат работать даже после истечения подписки в боте
                         await vpn_client.disable_user(user_id)
@@ -3692,63 +3678,17 @@ def _invalidate_sub_cache():
 _sub_cache = {}   # sub_id -> (monotonic, body, headers): короткий кэш, чтобы Happ не ждал панель на каждом обновлении
 SUB_CACHE_TTL = 60
 
-# Заглушки, которые панель подмешивает для неактивного клиента («⏳ Ваша подписка закончилась⌛»,
-# «Продление в боте @StopkaVPN_bot»): в приложении это «локации» с н/д, толку от них нет.
-_PLACEHOLDER_MARKERS = ("подписка закончилась", "продление в боте", "⏳", "⌛")
+# Неактивная подписка: вместо локации VPN в Happ/INCY показываем две «пустые» локации-заглушки
+# (ничего не подключают, пинг н/д). Как только подписка снова активна — обновление подписки
+# возвращает обычную локацию, а заглушки исчезают.
+INACTIVE_SUB_NAMES = ("⏳ Ваша подписка закончилась⌛", "Продление в боте @StopkaVPN_bot")
 
-def _link_name(link):
-    """Имя сервера из ссылки подключения (фрагмент после #; у vmess — поле ps внутри base64)."""
-    try:
-        if link.startswith("vmess://"):
-            raw = link[len("vmess://"):].split("#", 1)[0]
-            raw += "=" * (-len(raw) % 4)
-            return str(json.loads(base64.b64decode(raw).decode("utf-8")).get("ps", ""))
-        return unquote(link.split("#", 1)[1]) if "#" in link else ""
-    except Exception:
-        return ""
-
-def _is_placeholder_link(link):
-    name = _link_name(link).lower()
-    return any(marker in name for marker in _PLACEHOLDER_MARKERS)
-
-_real_links_mem = {}   # email -> список настоящих ссылок (копия того, что лежит в БД)
-
-def _uid_from_email(email):
-    m = re.fullmatch(r"user_(\d+)", str(email or ""))
-    return int(m.group(1)) if m else None
-
-async def remember_real_links(email, links):
-    """Запоминает последние настоящие ссылки клиента (память + БД), пока подписка активна."""
-    links = list(links)
-    if not links or _real_links_mem.get(email) == links:
-        return
-    _real_links_mem[email] = links
-    uid = _uid_from_email(email)
-    if uid is None:
-        return
-    try:
-        await asyncio.to_thread(db.conn.execute, "UPDATE users SET sub_links=? WHERE id=?",
-                                (json.dumps(links), uid))
-    except Exception as e:
-        logging.warning(f"Не удалось сохранить ссылки подключения {email}: {e}")
-
-async def load_real_links(email):
-    """Последние настоящие ссылки клиента — для неактивной подписки вместо заглушек панели."""
-    if _real_links_mem.get(email):
-        return list(_real_links_mem[email])
-    uid = _uid_from_email(email)
-    if uid is None:
-        return []
-    try:
-        row = (await asyncio.to_thread(db.conn.execute, "SELECT sub_links FROM users WHERE id=?", (uid,))).fetchone()
-        links = json.loads(row[0]) if row and row[0] else []
-    except Exception as e:
-        logging.warning(f"Не удалось прочитать ссылки подключения {email}: {e}")
-        return []
-    links = [l for l in links if isinstance(l, str) and not _is_placeholder_link(l)]
-    if links:
-        _real_links_mem[email] = links
-    return links
+def _inactive_links():
+    uid = "00000000-0000-4000-8000-000000000000"
+    return [
+        f"vless://{uid}@127.0.0.1:1?encryption=none&type=tcp&security=none#{quote(name)}"
+        for name in INACTIVE_SUB_NAMES
+    ]
 
 async def handle_subscription(request):
     """Публичная подписка через сервер бота (Render, https): отдаёт клиентам ссылки подключения,
@@ -3770,26 +3710,23 @@ async def handle_subscription(request):
         if not client or not client.get("email"):
             logging.warning(f"Подписка {sub_id[:4]}…: клиент с таким subId не найден на панели")
             return web.Response(status=404, text="not found")
-        links = await vpn_client.fetch_client_links(client["email"], sub_id)
+        try:
+            _exp = int(client.get("expiryTime") or 0)
+        except (TypeError, ValueError):
+            _exp = 0
+        # Подписка неактивна: клиент отключён на панели или срок вышел.
+        inactive = client.get("enable") in (False, 0) or (0 < _exp <= int(time.time() * 1000))
+        links = _inactive_links() if inactive else await vpn_client.fetch_client_links(client["email"], sub_id)
     except PanelError as e:
         logging.error(f"Подписка {sub_id[:4]}…: панель недоступна: {e}")
         return web.Response(status=502, text="panel unavailable")
-    # Фантомные «локации» неактивной подписки выбрасываем всегда. Если настоящих ссылок панель
-    # не дала (клиент отключён) — отдаём последние настоящие, чтобы в приложении осталась
-    # обычная локация VPN. Как только подписка снова активна, панель отдаёт ссылки сама.
-    real_links = [l for l in links if not _is_placeholder_link(l)]
-    if real_links:
-        await remember_real_links(client["email"], real_links)
-        links = real_links
-    else:
-        links = await load_real_links(client["email"])
     if not links:
         logging.error(f"Подписка {sub_id[:4]}…: панель не вернула ссылок подключения")
         return web.Response(status=502, text="no links")
 
     # Название сервера в Happ берётся из #имени ссылки; флаг страны — эмодзи в начале имени.
     server_name = os.environ.get("SUB_SERVER_NAME", "🇵🇱 Польша").strip()
-    if server_name:
+    if server_name and not inactive:   # у заглушек неактивной подписки свои названия
         renamed = []
         for i, link in enumerate(links, 1):
             if link.startswith("vmess://"):   # у vmess имя внутри base64 — не трогаем
